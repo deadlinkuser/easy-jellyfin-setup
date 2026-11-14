@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper
+# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper (v1.1)
 # ==============================================================================
 # Features:
 #   - Cross-distro OS & Podman >= 4.4 gatekeeper (/etc/os-release)
 #   - Rootless user check, /etc/subuid validation & smart loginctl linger prompt
+#   - Configurable Instance/Container Name (supports side-by-side test instances)
 #   - Smart NFS detection (auto-omits :Z on NFS, checks SELinux virt_use_nfs)
 #   - Optional GPU transcoding (/dev/dri + GroupAdd=keep-groups) & CPU/IO priority
-#   - Stage 1 (02:00): Atomic cold-stop backup -> YYYY-MM-DD_b0001.tar.gz (keep 2)
+#   - Stage 1 (02:00): Atomic cold-stop backup -> <name>_YYYY-MM-DD_b0001.tar.gz (keep 2)
 #   - Stage 2 (02:30): Centralized ZFS NFS sync (--ignore-existing, mount guard)
 #   - Generates HOW_TO_RESTORE.txt in both local staging and NAS backup roots
-#   - Verifies live HTTP response on port 8096 and optionally self-deletes
-#
-# Usage:
-#   chmod +x bootstrap-jellyfin.sh
-#   ./bootstrap-jellyfin.sh           # Interactive setup (offers self-cleanup)
-#   ./bootstrap-jellyfin.sh --keep    # Keep bootstrap script after completion
+#   - Verifies live HTTP response and optionally self-deletes
 # ==============================================================================
 
 set -euo pipefail
@@ -77,7 +73,6 @@ if ! command -v systemctl >/dev/null 2>&1; then
     exit 1
 fi
 
-# OS Detection via /etc/os-release
 OS_ID="unknown"
 OS_VERSION="0"
 OS_PRETTY="Unknown Linux"
@@ -151,7 +146,6 @@ else
         exit 0
     fi
 fi
-
 # ==============================================================================
 # 2. DEPENDENCY, PODMAN VERSION, SUBUID & LINGER CHECKS
 # ==============================================================================
@@ -176,7 +170,6 @@ if [[ "$(printf '%s\n' "$MIN_PODMAN" "$PODMAN_VER" | sort -V | head -n1)" != "$M
 fi
 ok "Podman v${PODMAN_VER} meets Quadlet requirements (>= ${MIN_PODMAN})."
 
-# Check /etc/subuid and /etc/subgid
 if ! grep -q "^${USER}:" /etc/subuid 2>/dev/null || ! grep -q "^${USER}:" /etc/subgid 2>/dev/null; then
     err "User '${USER}' lacks subordinate UID/GID ranges in /etc/subuid or /etc/subgid."
     info "Fix this as root with:"
@@ -184,8 +177,7 @@ if ! grep -q "^${USER}:" /etc/subuid 2>/dev/null || ! grep -q "^${USER}:" /etc/s
     exit 1
 fi
 ok "Rootless subuid/subgid mappings verified for '${USER}'."
-# === END OF PART 1 ===
-# Smart User Linger Check
+
 LINGER_STATE=$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo "no")
 if [[ "$LINGER_STATE" == "yes" ]]; then
     ok "User lingering is already enabled for '${USER}'."
@@ -207,13 +199,38 @@ else
 fi
 
 # ==============================================================================
-# 3. INTERACTIVE PATHS & HARDWARE CONFIGURATION
+# 3. INTERACTIVE INSTANCE NAME, PATHS & HARDWARE CONFIGURATION
 # ==============================================================================
-echo -e "\n${BOLD}--- Storage, Backup & Hardware Prompts ---${NC}"
+echo -e "\n${BOLD}--- Instance, Storage, Backup & Hardware Prompts ---${NC}"
+
+QUADLET_DIR="${HOME}/.config/containers/systemd"
+
+# Prompt 0: Container / Instance Name (allows side-by-side installs)
+DEFAULT_APP_NAME="jellyfin"
+while true; do
+    read -rp "$(echo -e "${BOLD}Container / Quadlet instance name [${DEFAULT_APP_NAME}]: ${NC}")" APP_NAME
+    APP_NAME="${APP_NAME:-$DEFAULT_APP_NAME}"
+
+    if [[ ! "$APP_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+        err "Invalid name '${APP_NAME}'. Use lowercase letters, numbers, hyphens (-), or underscores (_)."
+        continue
+    fi
+
+    if [[ -f "${QUADLET_DIR}/${APP_NAME}.container" || -d "${HOME}/containers/${APP_NAME}" ]]; then
+        warn "An instance named '${APP_NAME}' already exists (${QUADLET_DIR}/${APP_NAME}.container or ~/containers/${APP_NAME})."
+        if ! ask_yes_no "Overwrite existing '${APP_NAME}' Quadlet & backup units?" "N"; then
+            info "Tip: Choose a distinct name such as 'jellyfin-test' to run side-by-side."
+            continue
+        fi
+    fi
+    ok "Using instance name: ${BOLD}${APP_NAME}${NC}"
+    break
+done
 
 # Prompt 1: Media Path
 DEFAULT_MEDIA="/mnt/media/data"
 while true; do
+    echo ""
     read -rp "$(echo -e "${BOLD}Host path to your Media directory [${DEFAULT_MEDIA}]: ${NC}")" MEDIA_PATH
     MEDIA_PATH="${MEDIA_PATH:-$DEFAULT_MEDIA}"
     MEDIA_PATH="${MEDIA_PATH%/}"
@@ -232,7 +249,6 @@ while true; do
         continue
     fi
 
-    # Warn if path itself is a bare mountpoint rather than a subfolder
     if mountpoint -q "$MEDIA_PATH"; then
         warn "'${MEDIA_PATH}' is a top-level mount point."
         warn "Using a subfolder (e.g., ${MEDIA_PATH}/data) prevents Jellyfin from wiping"
@@ -244,7 +260,6 @@ while true; do
     break
 done
 
-# Detect NFS & SELinux for Media Volume Label
 MEDIA_FSTYPE=$(stat -f -c %T "$MEDIA_PATH" 2>/dev/null || echo "unknown")
 MEDIA_VOL_OPTS=""
 if [[ "$MEDIA_FSTYPE" == "nfs"* ]]; then
@@ -268,7 +283,6 @@ while true; do
     NAS_BACKUP_ROOT="${NAS_BACKUP_ROOT:-$DEFAULT_NAS_BACKUP}"
     NAS_BACKUP_ROOT="${NAS_BACKUP_ROOT%/}"
 
-    # Walk up to find nearest existing ancestor and verify it's mounted
     CHECK_DIR="$NAS_BACKUP_ROOT"
     while [[ ! -e "$CHECK_DIR" && "$CHECK_DIR" != "/" ]]; do
         CHECK_DIR="$(dirname "$CHECK_DIR")"
@@ -285,8 +299,8 @@ while true; do
         ok "Verified '${NAS_BACKUP_ROOT}' resides on active mount point '${MOUNT_ROOT}'."
     fi
 
-    if ! mkdir -p "${NAS_BACKUP_ROOT}/jellyfin" 2>/dev/null; then
-        err "Permission denied creating '${NAS_BACKUP_ROOT}/jellyfin'."
+    if ! mkdir -p "${NAS_BACKUP_ROOT}/${APP_NAME}" 2>/dev/null; then
+        err "Permission denied creating '${NAS_BACKUP_ROOT}/${APP_NAME}'."
         info "On your host, run: sudo mkdir -p '${NAS_BACKUP_ROOT}' && sudo chown -R ${USER}:${USER} '${NAS_BACKUP_ROOT}'"
         if ask_yes_no "Retry after fixing permissions?" "Y"; then
             continue
@@ -299,9 +313,9 @@ while true; do
     ok "NAS backup target verified and writable."
     break
 done
-
 # Prompt 3: Port Selection
-read -rp "$(echo -e "${BOLD}Host HTTP port for Jellyfin web UI: ${NC}")" JELLYFIN_PORT
+echo ""
+read -rp "$(echo -e "${BOLD}Host HTTP port for ${APP_NAME} web UI: ${NC}")" JELLYFIN_PORT
 JELLYFIN_PORT="${JELLYFIN_PORT:-8096}"
 
 # Prompt 4: GPU Hardware Transcoding
@@ -336,19 +350,19 @@ if ask_yes_no "Set lower CPU & I/O priority (Nice=10, CPUWeight=50) so scans/tra
 fi
 
 # Prompt 6: NAS Retention Days
+echo ""
 read -rp "$(echo -e "${BOLD}Days to retain backups on NAS/ZFS warehouse: ${NC}")" NAS_RETENTION_DAYS
 NAS_RETENTION_DAYS="${NAS_RETENTION_DAYS:-30}"
-# === END OF PART 2A ===
+
 # ==============================================================================
 # 4. CREATE DIRECTORY STRUCTURE
 # ==============================================================================
-info "Creating rootless directory hierarchy in ${HOME}..."
+info "Creating rootless directory hierarchy in ${HOME} for '${APP_NAME}'..."
 
-QUADLET_DIR="${HOME}/.config/containers/systemd"
-APP_DIR="${HOME}/containers/jellyfin"
+APP_DIR="${HOME}/containers/${APP_NAME}"
 SHARED_SCRIPTS_DIR="${HOME}/containers/shared-scripts"
 STAGING_ROOT="${HOME}/backups/staging"
-STAGING_JF="${STAGING_ROOT}/jellyfin"
+STAGING_APP="${STAGING_ROOT}/${APP_NAME}"
 
 mkdir -p \
     "$QUADLET_DIR" \
@@ -356,12 +370,12 @@ mkdir -p \
     "${APP_DIR}/cache" \
     "${APP_DIR}/scripts" \
     "$SHARED_SCRIPTS_DIR" \
-    "$STAGING_JF"
+    "$STAGING_APP"
 
 # ==============================================================================
-# 5. WRITE JELLYFIN QUADLET FILE
+# 5. WRITE QUADLET FILE
 # ==============================================================================
-info "Writing Quadlet unit: ${QUADLET_DIR}/jellyfin.container"
+info "Writing Quadlet unit: ${QUADLET_DIR}/${APP_NAME}.container"
 
 GPU_BLOCK=""
 if [[ "$ENABLE_GPU" == true ]]; then
@@ -373,23 +387,23 @@ if [[ "$LOW_PRIORITY" == true ]]; then
     PRIORITY_BLOCK=$'# Keep host desktop/services responsive during heavy scans/transcodes\nNice=10\nCPUWeight=50\nIOSchedulingPriority=6'
 fi
 
-cat > "${QUADLET_DIR}/jellyfin.container" <<EOF
+cat > "${QUADLET_DIR}/${APP_NAME}.container" <<EOF
 [Unit]
-Description=Jellyfin Media Server (Rootless Podman Quadlet)
+Description=Jellyfin Media Server (${APP_NAME} - Rootless Podman Quadlet)
 After=network-online.target
 Wants=network-online.target
 
 [Container]
 Image=docker.io/jellyfin/jellyfin:latest
-ContainerName=jellyfin
+ContainerName=${APP_NAME}
 AutoUpdate=registry
 
 # Networking
 PublishPort=${JELLYFIN_PORT}:8096
 
 # Persistent & Disposable Storage
-Volume=%h/containers/jellyfin/config:/config:Z
-Volume=%h/containers/jellyfin/cache:/cache:Z
+Volume=%h/containers/${APP_NAME}/config:/config:Z
+Volume=%h/containers/${APP_NAME}/cache:/cache:Z
 Volume=${MEDIA_PATH}:/media${MEDIA_VOL_OPTS}
 
 ${GPU_BLOCK}
@@ -403,86 +417,80 @@ ${PRIORITY_BLOCK}
 WantedBy=default.target
 EOF
 
-# Keep a copy of the Quadlet inside ~/containers/jellyfin for single-folder portability
-cp "${QUADLET_DIR}/jellyfin.container" "${APP_DIR}/jellyfin.container.backup"
+cp "${QUADLET_DIR}/${APP_NAME}.container" "${APP_DIR}/${APP_NAME}.container.backup"
 
 # ==============================================================================
 # 6. WRITE STAGE 1 BACKUP SCRIPT & SYSTEMD UNITS (LOCAL STAGING, KEEP 2)
 # ==============================================================================
 info "Configuring Stage 1 atomic backup script & timer (02:00 AM daily)..."
 
-cat > "${APP_DIR}/scripts/jellyfin-backup.sh" <<'EOF'
+cat > "${APP_DIR}/scripts/${APP_NAME}-backup.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="jellyfin"
-CONFIG_PARENT="${HOME}/containers/${APP_NAME}"
-STAGING_ROOT="${HOME}/backups/staging"
-STAGING_DIR="${STAGING_ROOT}/${APP_NAME}"
-COUNT_FILE="${STAGING_ROOT}/.${APP_NAME}-backup.count"
+APP_NAME="${APP_NAME}"
+CONFIG_PARENT="\${HOME}/containers/\${APP_NAME}"
+STAGING_ROOT="\${HOME}/backups/staging"
+STAGING_DIR="\${STAGING_ROOT}/\${APP_NAME}"
+COUNT_FILE="\${STAGING_ROOT}/.\${APP_NAME}-backup.count"
 KEEP_LOCAL=2
 
-mkdir -p "$STAGING_DIR"
+mkdir -p "\$STAGING_DIR"
 
-# Increment sequential run counter (0001, 0002, ...)
 LAST_NUM=0
-if [[ -f "$COUNT_FILE" ]]; then
-    LAST_NUM=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+if [[ -f "\$COUNT_FILE" ]]; then
+    LAST_NUM=\$(cat "\$COUNT_FILE" 2>/dev/null || echo 0)
 fi
-NEXT_NUM=$((10#$LAST_NUM + 1))
-printf "%04d" "$NEXT_NUM" > "$COUNT_FILE"
-SEQ_TAG=$(printf "b%04d" "$NEXT_NUM")
-DATE_TAG=$(date +%F)
+NEXT_NUM=\$((10#\$LAST_NUM + 1))
+printf "%04d" "\$NEXT_NUM" > "\$COUNT_FILE"
+SEQ_TAG=\$(printf "b%04d" "\$NEXT_NUM")
+DATE_TAG=\$(date +%F)
 
-ARCHIVE_NAME="${APP_NAME}_${DATE_TAG}_${SEQ_TAG}.tar.gz"
-TMP_ARCHIVE="/tmp/${ARCHIVE_NAME}"
-FINAL_ARCHIVE="${STAGING_DIR}/${ARCHIVE_NAME}"
+ARCHIVE_NAME="\${APP_NAME}_\${DATE_TAG}_\${SEQ_TAG}.tar.gz"
+TMP_ARCHIVE="/tmp/\${ARCHIVE_NAME}"
+FINAL_ARCHIVE="\${STAGING_DIR}/\${ARCHIVE_NAME}"
 
-echo "[$(date -Is)] Starting cold-stop backup: ${ARCHIVE_NAME}"
+echo "[\$(date -Is)] Starting cold-stop backup: \${ARCHIVE_NAME}"
 
-# Ensure Jellyfin always restarts even if tar fails
 restart_service() {
-    echo "[$(date -Is)] Starting ${APP_NAME}.service..."
-    systemctl --user start "${APP_NAME}.service"
+    echo "[\$(date -Is)] Starting \${APP_NAME}.service..."
+    systemctl --user start "\${APP_NAME}.service"
 }
 trap restart_service EXIT
 
-systemctl --user stop "${APP_NAME}.service"
-tar -czf "$TMP_ARCHIVE" -C "$CONFIG_PARENT" config
-mv "$TMP_ARCHIVE" "$FINAL_ARCHIVE"
+systemctl --user stop "\${APP_NAME}.service"
+tar -czf "\$TMP_ARCHIVE" -C "\$CONFIG_PARENT" config
+mv "\$TMP_ARCHIVE" "\$FINAL_ARCHIVE"
 
-# Restart immediately via trap, then clear trap
 restart_service
 trap - EXIT
 
-echo "[$(date -Is)] Backup saved to ${FINAL_ARCHIVE} ($(du -h "$FINAL_ARCHIVE" | cut -f1))"
+echo "[\$(date -Is)] Backup saved to \${FINAL_ARCHIVE} (\$(du -h "\$FINAL_ARCHIVE" | cut -f1))"
 
-# Rotate local staging: keep only the newest $KEEP_LOCAL archives
-mapfile -t OLD_FILES < <(ls -1t "${STAGING_DIR}/${APP_NAME}_"*.tar.gz 2>/dev/null | tail -n +$((KEEP_LOCAL + 1)))
-if [[ ${#OLD_FILES[@]} -gt 0 ]]; then
-    echo "[$(date -Is)] Rotating out ${#OLD_FILES[@]} old local staging archive(s)..."
-    rm -f "${OLD_FILES[@]}"
+mapfile -t OLD_FILES < <(ls -1t "\${STAGING_DIR}/\${APP_NAME}_"*.tar.gz 2>/dev/null | tail -n +\$((KEEP_LOCAL + 1)))
+if [[ \${#OLD_FILES[@]} -gt 0 ]]; then
+    echo "[\$(date -Is)] Rotating out \${#OLD_FILES[@]} old local staging archive(s)..."
+    rm -f "\${OLD_FILES[@]}"
 fi
 
-# Prune superseded Podman images to prevent disk bloat
 podman image prune -f >/dev/null 2>&1 || true
-echo "[$(date -Is)] Stage 1 backup complete."
+echo "[\$(date -Is)] Stage 1 backup complete."
 EOF
 
-chmod +x "${APP_DIR}/scripts/jellyfin-backup.sh"
+chmod +x "${APP_DIR}/scripts/${APP_NAME}-backup.sh"
 
-cat > "${QUADLET_DIR}/jellyfin-backup.service" <<EOF
+cat > "${QUADLET_DIR}/${APP_NAME}-backup.service" <<EOF
 [Unit]
-Description=Jellyfin Stage 1 Atomic Config Backup
+Description=${APP_NAME} Stage 1 Atomic Config Backup
 
 [Service]
 Type=oneshot
-ExecStart=%h/containers/jellyfin/scripts/jellyfin-backup.sh
+ExecStart=%h/containers/${APP_NAME}/scripts/${APP_NAME}-backup.sh
 EOF
 
-cat > "${QUADLET_DIR}/jellyfin-backup.timer" <<EOF
+cat > "${QUADLET_DIR}/${APP_NAME}-backup.timer" <<EOF
 [Unit]
-Description=Daily Stage 1 Jellyfin Backup (02:00 AM)
+Description=Daily Stage 1 ${APP_NAME} Backup (02:00 AM)
 
 [Timer]
 OnCalendar=*-*-* 02:00:00
@@ -491,7 +499,6 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-# === END OF PART 2B-1 ===
 # ==============================================================================
 # 7. WRITE STAGE 2 CENTRALIZED NAS SYNC SCRIPT & SYSTEMD UNITS (02:30 AM)
 # ==============================================================================
@@ -508,25 +515,21 @@ RETENTION_DAYS=${NAS_RETENTION_DAYS}
 
 echo "[\$(date -Is)] Starting Stage 2 NAS sync -> \${NAS_BACKUP_ROOT}"
 
-# Guard 1: Verify mount point if not on root filesystem
 if [[ "\$MOUNT_ROOT" != "/" ]] && ! mountpoint -q "\$MOUNT_ROOT"; then
     echo "[\$(date -Is)] ERROR: Mount point '\${MOUNT_ROOT}' is NOT mounted! Aborting to protect local disk." >&2
     exit 1
 fi
 
-# Guard 2: Verify sentinel file
 if [[ ! -f "\${NAS_BACKUP_ROOT}/.backup-target-verified" ]]; then
     echo "[\$(date -Is)] ERROR: Sentinel '\${NAS_BACKUP_ROOT}/.backup-target-verified' missing! Aborting." >&2
     exit 1
 fi
 
-# Push new archives without re-copying existing ones; always update HOW_TO_RESTORE.txt
 rsync -av --ignore-existing --exclude='.*' "\${STAGING_ROOT}/" "\${NAS_BACKUP_ROOT}/"
 if [[ -f "\${STAGING_ROOT}/HOW_TO_RESTORE.txt" ]]; then
     cp -f "\${STAGING_ROOT}/HOW_TO_RESTORE.txt" "\${NAS_BACKUP_ROOT}/HOW_TO_RESTORE.txt"
 fi
 
-# Prune archives older than RETENTION_DAYS on the NAS warehouse
 if [[ "\$RETENTION_DAYS" -gt 0 ]]; then
     find "\${NAS_BACKUP_ROOT}" -type f -name "*.tar.gz" -mtime +"${NAS_RETENTION_DAYS}" -delete
 fi
@@ -564,34 +567,35 @@ info "Writing HOW_TO_RESTORE.txt to local staging and NAS backup roots..."
 
 cat > "${STAGING_ROOT}/HOW_TO_RESTORE.txt" <<EOF
 ================================================================================
-JELLYFIN DISASTER RECOVERY & RESTORE GUIDE
+JELLYFIN DISASTER RECOVERY & RESTORE GUIDE (Instance: ${APP_NAME})
 ================================================================================
 Generated for user: ${USER}
+Instance name:      ${APP_NAME}
 Host media path:    ${MEDIA_PATH}  (Mounted inside container as /media)
-Local staging path: ${STAGING_ROOT}/jellyfin
-NAS backup path:    ${NAS_BACKUP_ROOT}/jellyfin
+Local staging path: ${STAGING_APP}
+NAS backup path:    ${NAS_BACKUP_ROOT}/${APP_NAME}
 
 --------------------------------------------------------------------------------
 SCENARIO A: RESTORE CONFIGURATION / DATABASE ON EXISTING SERVER
 --------------------------------------------------------------------------------
-1. Pick the backup archive you want to restore (e.g., jellyfin_YYYY-MM-DD_b0001.tar.gz)
+1. Pick the backup archive you want to restore (e.g., ${APP_NAME}_YYYY-MM-DD_b0001.tar.gz)
    and verify it is readable:
-     tar -tzf /path/to/jellyfin_YYYY-MM-DD_b0001.tar.gz >/dev/null && echo "Archive OK"
+     tar -tzf /path/to/${APP_NAME}_YYYY-MM-DD_b0001.tar.gz >/dev/null && echo "Archive OK"
 
-2. Stop the Jellyfin container cleanly:
-     systemctl --user stop jellyfin.service
+2. Stop the container cleanly:
+     systemctl --user stop ${APP_NAME}.service
 
 3. Move the broken config folder aside (do not delete until restore is verified):
-     mv ~/containers/jellyfin/config ~/containers/jellyfin/config.broken.\$(date +%F)
+     mv ~/containers/${APP_NAME}/config ~/containers/${APP_NAME}/config.broken.\$(date +%F)
 
-4. Extract the backup archive into ~/containers/jellyfin/:
-     tar -xzf /path/to/jellyfin_YYYY-MM-DD_b0001.tar.gz -C ~/containers/jellyfin/
+4. Extract the backup archive into ~/containers/${APP_NAME}/:
+     tar -xzf /path/to/${APP_NAME}_YYYY-MM-DD_b0001.tar.gz -C ~/containers/${APP_NAME}/
 
-5. Start Jellyfin again:
-     systemctl --user start jellyfin.service
+5. Start the container again:
+     systemctl --user start ${APP_NAME}.service
 
 6. Once confirmed working, remove the old broken folder:
-     rm -rf ~/containers/jellyfin/config.broken.*
+     rm -rf ~/containers/${APP_NAME}/config.broken.*
 
 --------------------------------------------------------------------------------
 SCENARIO B: FULL REBUILD ON A BRAND-NEW LINUX INSTALL
@@ -603,41 +607,41 @@ SCENARIO B: FULL REBUILD ON A BRAND-NEW LINUX INSTALL
    to '/media' inside the container so watch history & favorites stay linked).
 
 3. Recreate directories & enable linger:
-     mkdir -p ~/.config/containers/systemd ~/containers/jellyfin/{config,cache,scripts}
+     mkdir -p ~/.config/containers/systemd ~/containers/${APP_NAME}/{config,cache,scripts}
      loginctl enable-linger \$USER
 
-4. Extract your backup archive into ~/containers/jellyfin/:
-     tar -xzf /path/to/jellyfin_YYYY-MM-DD_b0001.tar.gz -C ~/containers/jellyfin/
+4. Extract your backup archive into ~/containers/${APP_NAME}/:
+     tar -xzf /path/to/${APP_NAME}_YYYY-MM-DD_b0001.tar.gz -C ~/containers/${APP_NAME}/
 
-5. Restore your Quadlet file to ~/.config/containers/systemd/jellyfin.container
+5. Restore your Quadlet file to ~/.config/containers/systemd/${APP_NAME}.container
    and start the service:
      systemctl --user daemon-reload
-     systemctl --user start jellyfin.service
+     systemctl --user start ${APP_NAME}.service
 
 --------------------------------------------------------------------------------
 MANUAL BACKUP & LOG COMMANDS
 --------------------------------------------------------------------------------
-  Run Stage 1 backup now:   systemctl --user start jellyfin-backup.service
+  Run Stage 1 backup now:   systemctl --user start ${APP_NAME}-backup.service
   Run Stage 2 NAS sync now: systemctl --user start nas-backup-sync.service
-  Check backup logs:        journalctl --user -u jellyfin-backup -u nas-backup-sync -n 50
-  Check Jellyfin logs:      journalctl --user -u jellyfin -f
+  Check backup logs:        journalctl --user -u ${APP_NAME}-backup -u nas-backup-sync -n 50
+  Check container logs:     journalctl --user -u ${APP_NAME} -f
 ================================================================================
 EOF
 
 cp -f "${STAGING_ROOT}/HOW_TO_RESTORE.txt" "${NAS_BACKUP_ROOT}/HOW_TO_RESTORE.txt"
 
 # ==============================================================================
-# 9. RELOAD SYSTEMD, ENABLE TIMERS & VERIFY JELLYFIN STARTUP
+# 9. RELOAD SYSTEMD, ENABLE TIMERS & VERIFY CONTAINER STARTUP
 # ==============================================================================
 info "Reloading systemd user daemon and enabling backup timers..."
 systemctl --user daemon-reload
-systemctl --user enable --now jellyfin-backup.timer
+systemctl --user enable --now "${APP_NAME}-backup.timer"
 systemctl --user enable --now nas-backup-sync.timer
 
-info "Pulling Jellyfin image and starting jellyfin.service (this may take a minute on first run)..."
-systemctl --user start jellyfin.service
+info "Pulling Jellyfin image and starting ${APP_NAME}.service (this may take a minute on first run)..."
+systemctl --user start "${APP_NAME}.service"
 
-info "Waiting for Jellyfin web interface on http://localhost:${JELLYFIN_PORT} ..."
+info "Waiting for ${APP_NAME} web interface on http://localhost:${JELLYFIN_PORT} ..."
 READY=false
 for i in $(seq 1 45); do
     if curl -fsS "http://127.0.0.1:${JELLYFIN_PORT}/health" >/dev/null 2>&1 || \
@@ -651,7 +655,7 @@ done
 echo ""
 if [[ "$READY" == true ]]; then
     HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    ok "${BOLD}Jellyfin is UP and responding!${NC}"
+    ok "${BOLD}${APP_NAME} is UP and responding!${NC}"
     echo -e "  Local URL:   ${BOLD}http://localhost:${JELLYFIN_PORT}${NC}"
     [[ -n "$HOST_IP" ]] && echo -e "  Network URL: ${BOLD}http://${HOST_IP}:${JELLYFIN_PORT}${NC}"
     echo ""
@@ -660,10 +664,10 @@ if [[ "$READY" == true ]]; then
     echo "     - Check 'Nfo' under Metadata savers"
     echo "     - Check 'Save artwork into media folders'"
     echo "  2. Test your backup pipeline right now with:"
-    echo "     systemctl --user start jellyfin-backup.service && systemctl --user start nas-backup-sync.service"
+    echo "     systemctl --user start ${APP_NAME}-backup.service && systemctl --user start nas-backup-sync.service"
 else
-    warn "Jellyfin container started, but port ${JELLYFIN_PORT} did not respond within 90 seconds."
-    warn "It may still be initializing. Check status with: journalctl --user -u jellyfin -f"
+    warn "${APP_NAME} container started, but port ${JELLYFIN_PORT} did not respond within 90 seconds."
+    warn "It may still be initializing. Check status with: journalctl --user -u ${APP_NAME} -f"
 fi
 
 # ==============================================================================
@@ -671,7 +675,7 @@ fi
 # ==============================================================================
 echo ""
 if [[ "$KEEP_SCRIPT" == false ]]; then
-    if ask_yes_no "Have you verified Jellyfin is working and want to delete this bootstrap script now?" "N"; then
+    if ask_yes_no "Have you verified ${APP_NAME} is working and want to delete this bootstrap script now?" "N"; then
         SCRIPT_PATH="$(realpath "$0")"
         rm -f "$SCRIPT_PATH"
         ok "Removed ${SCRIPT_PATH}. Setup complete!"
@@ -681,5 +685,4 @@ if [[ "$KEEP_SCRIPT" == false ]]; then
 else
     info "Flag --keep passed: keeping $(basename "$0")."
 fi
-# === END OF SCRIPT ===
 
