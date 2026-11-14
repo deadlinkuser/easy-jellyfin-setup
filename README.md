@@ -17,7 +17,7 @@ An interactive, cross-distro bootstrap script that deploys **Jellyfin** using **
 
 Clone via **HTTPS** (works on any machine without SSH keys):
 ```bash
-git clone https://github.com
+git clone https://github.com/deadlinkuser/podman-jellyfin-quadlet.git
 cd podman-jellyfin-quadlet
 ./bootstrap-jellyfin.sh --keep
 ```
