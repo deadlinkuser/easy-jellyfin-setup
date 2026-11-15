@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper (v1.1)
+# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper (v1.2)
 # ==============================================================================
 # Features:
 #   - Cross-distro OS & Podman >= 4.4 gatekeeper (/etc/os-release)
@@ -204,6 +204,7 @@ fi
 echo -e "\n${BOLD}--- Instance, Storage, Backup & Hardware Prompts ---${NC}"
 
 QUADLET_DIR="${HOME}/.config/containers/systemd"
+SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 
 # Prompt 0: Container / Instance Name (allows side-by-side installs)
 DEFAULT_APP_NAME="jellyfin"
@@ -277,6 +278,11 @@ fi
 
 # Prompt 2: NAS / ZFS Backup Destination
 DEFAULT_NAS_BACKUP="/mnt/nas/container-backups"
+EXISTING_SYNC_SCRIPT="${HOME}/containers/shared-scripts/nas-backup-sync.sh"
+if [[ -f "$EXISTING_SYNC_SCRIPT" ]]; then
+    DETECTED_NAS=$(grep -E '^NAS_BACKUP_ROOT=' "$EXISTING_SYNC_SCRIPT" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
+    [[ -n "$DETECTED_NAS" ]] && DEFAULT_NAS_BACKUP="$DETECTED_NAS"
+fi
 while true; do
     echo ""
     read -rp "$(echo -e "${BOLD}Host path to NAS/ZFS backup parent directory [${DEFAULT_NAS_BACKUP}]: ${NC}")" NAS_BACKUP_ROOT
@@ -313,15 +319,37 @@ while true; do
     ok "NAS backup target verified and writable."
     break
 done
-# Prompt 3: Port Selection
-echo ""
-read -rp "$(echo -e "${BOLD}Host HTTP port for ${APP_NAME} web UI: ${NC}")" JELLYFIN_PORT
-JELLYFIN_PORT="${JELLYFIN_PORT:-8096}"
+# Prompt 3: Port Selection (displays default & checks if occupied)
+while true; do
+    echo ""
+    read -rp "$(echo -e "${BOLD}Host HTTP port for ${APP_NAME} web UI: ${NC}")" JELLYFIN_PORT
+    JELLYFIN_PORT="${JELLYFIN_PORT:-8096}"
+    if [[ ! "$JELLYFIN_PORT" =~ ^[0-9]+$ ]] || (( JELLYFIN_PORT < 1024 || JELLYFIN_PORT > 65535 )); then
+        err "Please enter a valid unprivileged port number (1024-65535)."
+        continue
+    fi
+    if ss -tln 2>/dev/null | grep -qE ":${JELLYFIN_PORT}"; then
+        warn "Port ${JELLYFIN_PORT} is ALREADY in use on this host!"
+        if ! ask_yes_no "Use port ${JELLYFIN_PORT} anyway?" "N"; then
+            continue
+        fi
+    fi
+    break
+done
 
-# Prompt 4: GPU Hardware Transcoding
+# Prompt 4: GPU Hardware Transcoding (with 8th Gen+ guidance & official docs link)
 ENABLE_GPU=false
 if [[ -d /dev/dri ]]; then
     echo ""
+    echo -e "${BOLD}Hardware Acceleration (/dev/dri) Guidance:${NC}"
+    echo "  • Why enable (Y): Offloads 4K/HEVC transcoding to your GPU so streams don't max"
+    echo "    out your CPU. Best on Intel 8th Gen+ (Coffee Lake or newer), AMD Ryzen/Radeon"
+    echo "    (VCN), or supported NVIDIA GPUs."
+    echo "  • Why skip (n): Older CPUs (7th Gen Intel or earlier, which often hit VA-API /"
+    echo "    tone-mapping quirks), headless VMs without GPU passthrough, or libraries that"
+    echo "    Direct Play natively without transcoding."
+    echo "  • The best source for documentation on hardware acceleration in Jellyfin is:"
+    echo "    https://jellyfin.org"
     if ask_yes_no "GPU device (/dev/dri) detected. Enable hardware transcoding passthrough?" "Y"; then
         ENABLE_GPU=true
         USER_GROUPS=$(id -nG "$USER")
@@ -349,10 +377,33 @@ if ask_yes_no "Set lower CPU & I/O priority (Nice=10, CPUWeight=50) so scans/tra
     LOW_PRIORITY=true
 fi
 
-# Prompt 6: NAS Retention Days
+# Prompt 6: NAS Retention Days (auto-detects existing setting or defaults to)
+DEFAULT_RETENTION=30
+EXISTING_SYNC_SCRIPT="${HOME}/containers/shared-scripts/nas-backup-sync.sh"
+if [[ -f "$EXISTING_SYNC_SCRIPT" ]]; then
+    DETECTED_RETENTION=$(grep -E '^RETENTION_DAYS=' "$EXISTING_SYNC_SCRIPT" 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'" || true)
+    if [[ "$DETECTED_RETENTION" =~ ^[0-9]+$ ]]; then
+        DEFAULT_RETENTION="$DETECTED_RETENTION"
+    fi
+fi
+
 echo ""
-read -rp "$(echo -e "${BOLD}Days to retain backups on NAS/ZFS warehouse: ${NC}")" NAS_RETENTION_DAYS
-NAS_RETENTION_DAYS="${NAS_RETENTION_DAYS:-30}"
+read -rp "$(echo -e "${BOLD}Days to retain backups on NAS/ZFS warehouse [${DEFAULT_RETENTION}]: ${NC}")" NAS_RETENTION_DAYS
+NAS_RETENTION_DAYS="${NAS_RETENTION_DAYS:-$DEFAULT_RETENTION}"
+
+# Pre-Install Review Summary
+echo -e "\n${BOLD}--- Configuration Summary ---${NC}"
+echo "  Instance Name:   ${APP_NAME}"
+echo "  Web UI Port:     ${JELLYFIN_PORT}"
+echo "  Media Path:      ${MEDIA_PATH} (${MEDIA_FSTYPE})"
+echo "  NAS Backup Path: ${NAS_BACKUP_ROOT}/${APP_NAME} (Retain: ${NAS_RETENTION_DAYS} days)"
+echo "  GPU Passthrough: ${ENABLE_GPU}"
+echo "  Low CPU/IO Prio: ${LOW_PRIORITY}"
+echo ""
+if ! ask_yes_no "Proceed with creating directories, Quadlet, and backup timers?" "Y"; then
+    info "Aborted safely before making any system changes."
+    exit 0
+fi
 
 # ==============================================================================
 # 4. CREATE DIRECTORY STRUCTURE
@@ -366,6 +417,7 @@ STAGING_APP="${STAGING_ROOT}/${APP_NAME}"
 
 mkdir -p \
     "$QUADLET_DIR" \
+    "$SYSTEMD_USER_DIR" \
     "${APP_DIR}/config" \
     "${APP_DIR}/cache" \
     "${APP_DIR}/scripts" \
@@ -373,7 +425,7 @@ mkdir -p \
     "$STAGING_APP"
 
 # ==============================================================================
-# 5. WRITE QUADLET FILE
+# 5. WRITE QUADLET FILE (~/.config/containers/systemd/)
 # ==============================================================================
 info "Writing Quadlet unit: ${QUADLET_DIR}/${APP_NAME}.container"
 
@@ -420,7 +472,7 @@ EOF
 cp "${QUADLET_DIR}/${APP_NAME}.container" "${APP_DIR}/${APP_NAME}.container.backup"
 
 # ==============================================================================
-# 6. WRITE STAGE 1 BACKUP SCRIPT & SYSTEMD UNITS (LOCAL STAGING, KEEP 2)
+# 6. WRITE STAGE 1 BACKUP SCRIPT & SYSTEMD UNITS (~/.config/systemd/user/)
 # ==============================================================================
 info "Configuring Stage 1 atomic backup script & timer (02:00 AM daily)..."
 
@@ -479,7 +531,7 @@ EOF
 
 chmod +x "${APP_DIR}/scripts/${APP_NAME}-backup.sh"
 
-cat > "${QUADLET_DIR}/${APP_NAME}-backup.service" <<EOF
+cat > "${SYSTEMD_USER_DIR}/${APP_NAME}-backup.service" <<EOF
 [Unit]
 Description=${APP_NAME} Stage 1 Atomic Config Backup
 
@@ -488,7 +540,7 @@ Type=oneshot
 ExecStart=%h/containers/${APP_NAME}/scripts/${APP_NAME}-backup.sh
 EOF
 
-cat > "${QUADLET_DIR}/${APP_NAME}-backup.timer" <<EOF
+cat > "${SYSTEMD_USER_DIR}/${APP_NAME}-backup.timer" <<EOF
 [Unit]
 Description=Daily Stage 1 ${APP_NAME} Backup (02:00 AM)
 
@@ -539,7 +591,7 @@ EOF
 
 chmod +x "${SHARED_SCRIPTS_DIR}/nas-backup-sync.sh"
 
-cat > "${QUADLET_DIR}/nas-backup-sync.service" <<EOF
+cat > "${SYSTEMD_USER_DIR}/nas-backup-sync.service" <<EOF
 [Unit]
 Description=Centralized Stage 2 Container Backup Sync to NAS
 
@@ -548,7 +600,7 @@ Type=oneshot
 ExecStart=%h/containers/shared-scripts/nas-backup-sync.sh
 EOF
 
-cat > "${QUADLET_DIR}/nas-backup-sync.timer" <<EOF
+cat > "${SYSTEMD_USER_DIR}/nas-backup-sync.timer" <<EOF
 [Unit]
 Description=Daily Stage 2 NAS Backup Sync (02:30 AM)
 
@@ -607,15 +659,15 @@ SCENARIO B: FULL REBUILD ON A BRAND-NEW LINUX INSTALL
    to '/media' inside the container so watch history & favorites stay linked).
 
 3. Recreate directories & enable linger:
-     mkdir -p ~/.config/containers/systemd ~/containers/${APP_NAME}/{config,cache,scripts}
+     mkdir -p ~/.config/containers/systemd ~/.config/systemd/user ~/containers/${APP_NAME}/{config,cache,scripts}
      loginctl enable-linger \$USER
 
 4. Extract your backup archive into ~/containers/${APP_NAME}/:
      tar -xzf /path/to/${APP_NAME}_YYYY-MM-DD_b0001.tar.gz -C ~/containers/${APP_NAME}/
 
-5. Restore your Quadlet file to ~/.config/containers/systemd/${APP_NAME}.container
-   and start the service:
+5. Restore your Quadlet and backup timer units, then start the service:
      systemctl --user daemon-reload
+     systemctl --user enable --now ${APP_NAME}-backup.timer nas-backup-sync.timer
      systemctl --user start ${APP_NAME}.service
 
 --------------------------------------------------------------------------------
