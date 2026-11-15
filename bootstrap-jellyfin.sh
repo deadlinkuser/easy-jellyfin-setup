@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper (v1.2)
+# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper (v1.3)
 # ==============================================================================
 # Features:
 #   - Cross-distro OS & Podman >= 4.4 gatekeeper (/etc/os-release)
@@ -184,9 +184,9 @@ if [[ "$LINGER_STATE" == "yes" ]]; then
 else
     echo ""
     warn "User lingering is currently DISABLED for '${USER}'."
-    echo "  Why this matters: Without lingering, systemd stops your rootless Podman"
-    echo "  containers and backup timers whenever you log out of SSH or your desktop,"
-    echo "  and will not auto-start Jellyfin on reboot until you manually log in."
+    echo "  Why this matters: Without lingering, systemd stops your rootless"
+    echo "  containers and timers when you log out, and won't auto-start them"
+    echo "  after a reboot until you manually log in."
     if ask_yes_no "Enable user lingering now (loginctl enable-linger ${USER})?" "Y"; then
         if loginctl enable-linger "$USER" 2>/dev/null || sudo loginctl enable-linger "$USER"; then
             ok "User lingering enabled."
@@ -252,9 +252,9 @@ while true; do
 
     if mountpoint -q "$MEDIA_PATH"; then
         warn "'${MEDIA_PATH}' is a top-level mount point."
-        warn "Using a subfolder (e.g., ${MEDIA_PATH}/data) prevents Jellyfin from wiping"
-        warn "your library metadata if an NFS/external drive ever disconnects."
-        if ! ask_yes_no "Use '${MEDIA_PATH}' anyway?" "N"; then
+        warn "Using a subfolder (e.g., ${MEDIA_PATH}/media) prevents Jellyfin from"
+        warn "wiping your library metadata if an NFS/external drive disconnects."
+        if ! ask_yes_no "Use '${MEDIA_PATH}' anyway (or 'N' to enter a subfolder)?" "N"; then
             continue
         fi
     fi
@@ -342,13 +342,13 @@ ENABLE_GPU=false
 if [[ -d /dev/dri ]]; then
     echo ""
     echo -e "${BOLD}Hardware Acceleration (/dev/dri) Guidance:${NC}"
-    echo "  • Why enable (Y): Offloads 4K/HEVC transcoding to your GPU so streams don't max"
-    echo "    out your CPU. Best on Intel 8th Gen+ (Coffee Lake or newer), AMD Ryzen/Radeon"
-    echo "    (VCN), or supported NVIDIA GPUs."
-    echo "  • Why skip (n): Older CPUs (7th Gen Intel or earlier, which often hit VA-API /"
-    echo "    tone-mapping quirks), headless VMs without GPU passthrough, or libraries that"
-    echo "    Direct Play natively without transcoding."
-    echo "  • The best source for documentation on hardware acceleration in Jellyfin is:"
+    echo "  * Enable (Y): Offloads 4K/HEVC transcoding to your GPU so streams"
+    echo "    do not max out your CPU. Best on Intel 8th Gen+ (Coffee Lake or"
+    echo "    newer), AMD Ryzen/Radeon (VCN), or supported NVIDIA GPUs."
+    echo "  * Skip (n): Older CPUs (7th Gen Intel or earlier, which often hit"
+    echo "    VA-API/tone-mapping quirks), headless VMs without GPU passthrough,"
+    echo "    or libraries that Direct Play natively."
+    echo "  * Best source for Jellyfin hardware acceleration docs:"
     echo "    https://jellyfin.org"
     if ask_yes_no "GPU device (/dev/dri) detected. Enable hardware transcoding passthrough?" "Y"; then
         ENABLE_GPU=true
@@ -707,16 +707,23 @@ done
 echo ""
 if [[ "$READY" == true ]]; then
     HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    LOCAL_URL="http://localhost:${JELLYFIN_PORT}"
+    NET_URL=""
+    [[ -n "$HOST_IP" ]] && NET_URL="http://${HOST_IP}:${JELLYFIN_PORT}"
+
     ok "${BOLD}${APP_NAME} is UP and responding!${NC}"
-    echo -e "  Local URL:   ${BOLD}http://localhost:${JELLYFIN_PORT}${NC}"
-    [[ -n "$HOST_IP" ]] && echo -e "  Network URL: ${BOLD}http://${HOST_IP}:${JELLYFIN_PORT}${NC}"
+    echo ""
+    echo -e "${BOLD}Open Jellyfin Setup Wizard (Ctrl+Click or copy URL):${NC}"
+    echo "  Local:   ${LOCAL_URL}"
+    [[ -n "$NET_URL" ]] && echo "  Network: ${NET_URL}"
     echo ""
     echo -e "${BOLD}Recommended Post-Wizard Settings Inside Jellyfin:${NC}"
     echo "  1. Dashboard -> Libraries -> (3-dot menu) -> Manage library:"
     echo "     - Check 'Nfo' under Metadata savers"
     echo "     - Check 'Save artwork into media folders'"
-    echo "  2. Test your backup pipeline right now with:"
-    echo "     systemctl --user start ${APP_NAME}-backup.service && systemctl --user start nas-backup-sync.service"
+    echo "  2. Test your backup pipeline right now:"
+    echo "     systemctl --user start ${APP_NAME}-backup.service"
+    echo "     systemctl --user start nas-backup-sync.service"
 else
     warn "${APP_NAME} container started, but port ${JELLYFIN_PORT} did not respond within 90 seconds."
     warn "It may still be initializing. Check status with: journalctl --user -u ${APP_NAME} -f"
