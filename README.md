@@ -15,16 +15,10 @@ An interactive, cross-distro bootstrap script that deploys **Jellyfin** using **
 
 ## Quick Start
 
-Clone via **HTTPS** (works on any machine without SSH keys):
+ **Run the command below** (copy and paste into your terminal and press enter):
 ```bash
 git clone https://github.com/deadlinkuser/podman-jellyfin-quadlet.git
 cd podman-jellyfin-quadlet
 ./bootstrap-jellyfin.sh --keep
 ```
 
-Or clone via **SSH** (if your machine's SSH key is added to GitHub):
-```bash
-git clone git@github.com:deadlinkuser/podman-jellyfin-quadlet.git
-cd podman-jellyfin-quadlet
-./bootstrap-jellyfin.sh --keep
-```
