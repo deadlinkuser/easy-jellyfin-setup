@@ -21,4 +21,17 @@ git clone https://github.com/deadlinkuser/podman-jellyfin-quadlet.git
 cd podman-jellyfin-quadlet
 ./bootstrap-jellyfin.sh --keep
 ```
+## Verify Your Backup Pipeline
+Once the web UI responds, trigger a manual test run of both backup stages (replace \`jellyfin\` if you used a custom instance name):
+\`\`\`bash
+systemctl --user start jellyfin-backup.service
+systemctl --user start nas-backup-sync.service
+\`\`\`
 
+## Uninstall / Teardown
+To cleanly remove a specific Quadlet instance without touching your host media library (with prompts to keep or delete local/NAS backups):
+\`\`\`bash
+cd podman-jellyfin-quadlet
+./uninstall-jellyfin.sh
+\`\`\`
+EOF
