@@ -889,7 +889,6 @@ if [[ "$ENABLE_STAGE2" == true ]]; then
     STAGE2_LOG_FLAG=" -u nas-backup-sync"
 fi
 
-
 cat > "${STAGING_ROOT}/HOW_TO_RESTORE.txt" <<EOF
 ================================================================================
 JELLYFIN DISASTER RECOVERY & RESTORE GUIDE (Instance: ${APP_NAME})
