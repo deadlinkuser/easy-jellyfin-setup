@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper (v1.3)
+# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper (v1.4)
 # ==============================================================================
 # Features:
 #   - Cross-distro OS & Podman >= 4.4 gatekeeper (/etc/os-release)
@@ -8,7 +8,7 @@
 #   - Configurable Instance/Container Name (supports side-by-side test instances)
 #   - Smart NFS detection (auto-omits :Z on NFS, checks SELinux virt_use_nfs)
 #   - Optional GPU transcoding (/dev/dri + GroupAdd=keep-groups) & CPU/IO priority
-#   - Stage 1 (02:00): Atomic cold-stop backup -> <name>_YYYY-MM-DD_b0001.tar.gz (keep 2)
+#   - Stage 1 (02:00): Atomic cold-stop backup -> <name>_YYYY-MM-DD_b0001.tar.gz (keep 1, NAS keep 5)
 #   - Stage 2 (02:30): Centralized ZFS NFS sync (--ignore-existing, mount guard)
 #   - Generates HOW_TO_RESTORE.txt in both local staging and NAS backup roots
 #   - Verifies live HTTP response and optionally self-deletes
@@ -17,16 +17,36 @@
 set -euo pipefail
 
 KEEP_SCRIPT=false
-for arg in "$@"; do
-    case "$arg" in
-        --keep|--no-self-delete) KEEP_SCRIPT=true ;;
+UNINSTALL_MODE=false
+UNINSTALL_TARGET=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --keep|--no-self-delete)
+            KEEP_SCRIPT=true
+            shift
+            ;;
+        --uninstall)
+            UNINSTALL_MODE=true
+            if [[ -n "${2:-}" && ! "${2:-}" =~ ^- ]]; then
+                UNINSTALL_TARGET="$2"
+                shift
+            fi
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--keep]"
-            echo "  --keep    Do not offer to delete this script after verification."
+            echo "Usage: $0 [--keep] [--uninstall [instance_name]]"
+            echo "  --keep                      Do not offer to delete this script after verification."
+            echo "  --uninstall [instance_name] Cleanly stop and remove a Jellyfin instance and its timers."
             exit 0
+            ;;
+        *)
+            err "Unknown option: $1 (use --help for usage)"
+            exit 1
             ;;
     esac
 done
+
 
 # --- Formatting Helpers ---
 RED='\033[0;31m'
@@ -54,6 +74,106 @@ ask_yes_no() {
     fi
     [[ "$reply" =~ ^[Yy]$ ]]
 }
+
+# ==============================================================================
+# 0. BUILT-IN UNINSTALLER (--uninstall)
+# ==============================================================================
+if [[ "$UNINSTALL_MODE" == true ]]; then
+    echo -e "\n${BOLD}=== Jellyfin Rootless Podman Quadlet Uninstaller ===${NC}\n"
+
+    if [[ "$EUID" -eq 0 ]]; then
+        err "Do NOT run --uninstall as root or with sudo. Run as your standard user."
+        exit 1
+    fi
+
+    QUADLET_DIR="${HOME}/.config/containers/systemd"
+    SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
+
+    if [[ -z "$UNINSTALL_TARGET" ]]; then
+        read -rp "$(echo -e "${BOLD}Instance name to uninstall [jellyfin]: ${NC}")" UNINSTALL_TARGET
+        UNINSTALL_TARGET="${UNINSTALL_TARGET:-jellyfin}"
+    fi
+
+    APP_NAME="$UNINSTALL_TARGET"
+    APP_DIR="${HOME}/containers/${APP_NAME}"
+    STAGING_APP="${HOME}/backups/staging/${APP_NAME}"
+
+    if [[ ! -f "${QUADLET_DIR}/${APP_NAME}.container" && \
+          ! -f "${SYSTEMD_USER_DIR}/${APP_NAME}-backup.timer" && \
+          ! -d "$APP_DIR" ]]; then
+        warn "No Quadlet, backup timer, or folder found for '${APP_NAME}'."
+        exit 0
+    fi
+
+    echo "This will stop and remove:"
+    echo "  - Container service: ${APP_NAME}.service"
+    echo "  - Quadlet file:      ${QUADLET_DIR}/${APP_NAME}.container"
+    echo "  - Stage 1 backup:    ${APP_NAME}-backup.timer & .service"
+    echo ""
+    if ! ask_yes_no "Proceed with uninstalling '${APP_NAME}' units and timers?" "N"; then
+        info "Uninstall cancelled. Nothing was changed."
+        exit 0
+    fi
+
+    # 1. Stop and disable Stage 1 backup timer & service
+    info "Stopping and disabling ${APP_NAME} timers and container..."
+    systemctl --user disable --now "${APP_NAME}-backup.timer" 2>/dev/null || true
+    systemctl --user stop "${APP_NAME}-backup.service" 2>/dev/null || true
+
+    # 2. Stop the container service
+    systemctl --user stop "${APP_NAME}.service" 2>/dev/null || true
+
+    # 3. Delete unit & Quadlet files so nothing can ever auto-start again
+    rm -f \
+        "${QUADLET_DIR}/${APP_NAME}.container" \
+        "${SYSTEMD_USER_DIR}/${APP_NAME}-backup.timer" \
+        "${SYSTEMD_USER_DIR}/${APP_NAME}-backup.service"
+
+    # 4. Check if any OTHER app backup timers remain; if none, disable shared Stage 2 NAS timer
+    REMAINING_TIMERS=$(find "$SYSTEMD_USER_DIR" -maxdepth 1 -name "*-backup.timer" 2>/dev/null | wc -l)
+    if [[ "$REMAINING_TIMERS" -eq 0 && -f "${SYSTEMD_USER_DIR}/nas-backup-sync.timer" ]]; then
+        info "No other container backup timers remain."
+        if ask_yes_no "Disable and remove shared Stage 2 NAS sync timer (nas-backup-sync.timer) too?" "Y"; then
+            systemctl --user disable --now nas-backup-sync.timer 2>/dev/null || true
+            systemctl --user stop nas-backup-sync.service 2>/dev/null || true
+            rm -f \
+                "${SYSTEMD_USER_DIR}/nas-backup-sync.timer" \
+                "${SYSTEMD_USER_DIR}/nas-backup-sync.service" \
+                "${HOME}/containers/shared-scripts/nas-backup-sync.sh"
+            ok "Removed shared Stage 2 NAS sync timer and script."
+        fi
+    fi
+
+    # 5. Reload systemd and clear any failed state so no ghost units remain
+    systemctl --user daemon-reload
+    systemctl --user reset-failed 2>/dev/null || true
+    ok "All systemd units and timers for '${APP_NAME}' have been cleanly removed."
+
+    # 6. Optional data cleanup (kept separate so users never lose config/backups by accident)
+    echo ""
+    if [[ -d "$APP_DIR" ]]; then
+        if ask_yes_no "Delete container config & cache directory (${APP_DIR})? (No = keep data)" "N"; then
+            rm -rf "$APP_DIR"
+            ok "Deleted ${APP_DIR}."
+        else
+            info "Preserved ${APP_DIR} on disk."
+        fi
+    fi
+
+    if [[ -d "$STAGING_APP" ]]; then
+        if ask_yes_no "Delete local staging backups (${STAGING_APP})?" "N"; then
+            rm -rf "$STAGING_APP"
+            rm -f "${HOME}/backups/staging/.${APP_NAME}-backup.count"
+            ok "Deleted ${STAGING_APP}."
+        else
+            info "Preserved ${STAGING_APP} on disk."
+        fi
+    fi
+
+    ok "Uninstall of '${APP_NAME}' complete! (Your media files and NAS backups were untouched.)"
+    exit 0
+fi
+
 
 # ==============================================================================
 # 1. HARD BLOCKERS & OS GATEKEEPER
@@ -263,62 +383,129 @@ done
 
 MEDIA_FSTYPE=$(stat -f -c %T "$MEDIA_PATH" 2>/dev/null || echo "unknown")
 MEDIA_VOL_OPTS=""
-if [[ "$MEDIA_FSTYPE" == "nfs"* ]]; then
-    ok "Detected NFS filesystem (${MEDIA_FSTYPE}) for media -> omitting :Z label."
-    if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" == "Enforcing" ]]; then
-        if command -v getsebool >/dev/null 2>&1 && ! getsebool virt_use_nfs 2>/dev/null | grep -q "on$"; then
-            warn "SELinux is Enforcing and 'virt_use_nfs' is OFF!"
-            warn "Run: sudo setsebool -P virt_use_nfs 1"
+
+case "$MEDIA_FSTYPE" in
+    nfs*)
+        ok "Detected NFS network filesystem (${MEDIA_FSTYPE}) -> omitting :Z label."
+        if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" == "Enforcing" ]]; then
+            if command -v getsebool >/dev/null 2>&1 && ! getsebool virt_use_nfs 2>/dev/null | grep -q "on$"; then
+                warn "SELinux is Enforcing and 'virt_use_nfs' is OFF!"
+                warn "Run: sudo setsebool -P virt_use_nfs 1"
+            fi
         fi
+        ;;
+    cifs|smb*)
+        ok "Detected Samba/SMB network share (${MEDIA_FSTYPE}) -> omitting :Z label."
+        warn "Tip: Ensure your SMB mount in /etc/fstab includes 'uid=$(id -u),gid=$(id -g)'"
+        warn "     so rootless Jellyfin can read your media files cleanly."
+        ;;
+    ext2/ext3|ext4|btrfs|xfs|zfs|tmpfs|overlayfs)
+        MEDIA_VOL_OPTS=":Z"
+        ok "Detected local filesystem (${MEDIA_FSTYPE}) -> using :Z label."
+        ;;
+    *)
+        warn "Could not auto-identify filesystem type ('${MEDIA_FSTYPE}') for '${MEDIA_PATH}'."
+        echo "How is this media directory stored?"
+        echo "  1) Local drive (ext4, btrfs, xfs, zfs)  [uses :Z label]"
+        echo "  2) Samba / SMB network share (cifs)     [omits :Z label]"
+        echo "  3) NFS network share                    [omits :Z label]"
+        read -rp "$(echo -e "${BOLD}Select storage type [1-3, default 1]: ${NC}")" STORAGE_CHOICE
+        case "${STORAGE_CHOICE:-1}" in
+            2)
+                MEDIA_FSTYPE="smb (manual)"
+                ok "Configured for Samba/SMB -> omitting :Z label."
+                ;;
+            3)
+                MEDIA_FSTYPE="nfs (manual)"
+                ok "Configured for NFS -> omitting :Z label."
+                ;;
+            *)
+                MEDIA_FSTYPE="local (manual)"
+                MEDIA_VOL_OPTS=":Z"
+                ok "Configured for local storage -> using :Z label."
+                ;;
+        esac
+        ;;
+esac
+
+
+# Prompt 2: Stage 2 Backup Destination (Optional for single-drive / local-only users)
+ENABLE_STAGE2=false
+BACKUP_IS_NETWORK=false
+NAS_BACKUP_ROOT=""
+MOUNT_ROOT="/"
+
+echo ""
+if ask_yes_no "Enable Stage 2 off-site/NAS backup sync (recommended if you have a NAS or second drive)?" "Y"; then
+    ENABLE_STAGE2=true
+    DEFAULT_NAS_BACKUP="/mnt/nas/container-backups"
+    EXISTING_SYNC_SCRIPT="${HOME}/containers/shared-scripts/nas-backup-sync.sh"
+    if [[ -f "$EXISTING_SYNC_SCRIPT" ]]; then
+        DETECTED_NAS=$(grep -E '^NAS_BACKUP_ROOT=' "$EXISTING_SYNC_SCRIPT" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
+        [[ -n "$DETECTED_NAS" ]] && DEFAULT_NAS_BACKUP="$DETECTED_NAS"
     fi
-else
-    MEDIA_VOL_OPTS=":Z"
-    ok "Detected local filesystem (${MEDIA_FSTYPE}) for media -> using :Z label."
-fi
 
-# Prompt 2: NAS / ZFS Backup Destination
-DEFAULT_NAS_BACKUP="/mnt/nas/container-backups"
-EXISTING_SYNC_SCRIPT="${HOME}/containers/shared-scripts/nas-backup-sync.sh"
-if [[ -f "$EXISTING_SYNC_SCRIPT" ]]; then
-    DETECTED_NAS=$(grep -E '^NAS_BACKUP_ROOT=' "$EXISTING_SYNC_SCRIPT" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
-    [[ -n "$DETECTED_NAS" ]] && DEFAULT_NAS_BACKUP="$DETECTED_NAS"
-fi
-while true; do
-    echo ""
-    read -rp "$(echo -e "${BOLD}Host path to NAS/ZFS backup parent directory [${DEFAULT_NAS_BACKUP}]: ${NC}")" NAS_BACKUP_ROOT
-    NAS_BACKUP_ROOT="${NAS_BACKUP_ROOT:-$DEFAULT_NAS_BACKUP}"
-    NAS_BACKUP_ROOT="${NAS_BACKUP_ROOT%/}"
+    BACKUP_IS_NETWORK=true
+    while true; do
+        echo ""
+        read -rp "$(echo -e "${BOLD}Host path to Stage 2 backup parent directory [${DEFAULT_NAS_BACKUP}]: ${NC}")" NAS_BACKUP_ROOT
+        NAS_BACKUP_ROOT="${NAS_BACKUP_ROOT:-$DEFAULT_NAS_BACKUP}"
+        NAS_BACKUP_ROOT="${NAS_BACKUP_ROOT%/}"
 
-    CHECK_DIR="$NAS_BACKUP_ROOT"
-    while [[ ! -e "$CHECK_DIR" && "$CHECK_DIR" != "/" ]]; do
-        CHECK_DIR="$(dirname "$CHECK_DIR")"
+        CHECK_DIR="$NAS_BACKUP_ROOT"
+        while [[ ! -e "$CHECK_DIR" && "$CHECK_DIR" != "/" ]]; do
+            CHECK_DIR="$(dirname "$CHECK_DIR")"
+        done
+
+        BACKUP_FSTYPE=$(stat -f -c %T "$CHECK_DIR" 2>/dev/null || echo "unknown")
+        MOUNT_ROOT=$(findmnt -T "$CHECK_DIR" -no TARGET 2>/dev/null || echo "/")
+
+        case "$BACKUP_FSTYPE" in
+            nfs*|cifs|smb*)
+                BACKUP_IS_NETWORK=true
+                ok "Detected network share (${BACKUP_FSTYPE}) on mount '${MOUNT_ROOT}'."
+                ;;
+            *)
+                if [[ "$MOUNT_ROOT" == "/" ]]; then
+                    warn "'${NAS_BACKUP_ROOT}' resolves to your local root filesystem (/)."
+                    echo "Is this intended to be:"
+                    echo "  1) A network share (NFS/SMB) that isn't mounted yet  [abort & mount first]"
+                    echo "  2) Intentional local storage on this machine         [skip mount check, lower retention]"
+                    read -rp "$(echo -e "${BOLD}Select [1-2, default 1]: ${NC}")" BACKUP_LOC_CHOICE
+                    if [[ "${BACKUP_LOC_CHOICE:-1}" == "2" ]]; then
+                        BACKUP_IS_NETWORK=false
+                        MOUNT_ROOT="/"
+                        warn "Using local storage for Stage 2 backups (protects against config corruption, not drive failure)."
+                    else
+                        continue
+                    fi
+                else
+                    # Separate local partition/drive (e.g. /mnt/backup-ssd)
+                    BACKUP_IS_NETWORK=false
+                    ok "Detected separate local mount '${MOUNT_ROOT}' (${BACKUP_FSTYPE})."
+                fi
+                ;;
+        esac
+
+        if ! mkdir -p "${NAS_BACKUP_ROOT}/${APP_NAME}" 2>/dev/null; then
+            err "Permission denied creating '${NAS_BACKUP_ROOT}/${APP_NAME}'."
+            info "On your host, run: sudo mkdir -p '${NAS_BACKUP_ROOT}' && sudo chown -R ${USER}:${USER} '${NAS_BACKUP_ROOT}'"
+            if ask_yes_no "Retry after fixing permissions?" "Y"; then
+                continue
+            else
+                exit 1
+            fi
+        fi
+
+        touch "${NAS_BACKUP_ROOT}/.backup-target-verified"
+        ok "Stage 2 backup target verified and writable."
+        break
     done
+else
+    info "Stage 2 NAS sync skipped. Backups will stay in local staging (${HOME}/backups/staging/${APP_NAME})."
+fi
 
-    MOUNT_ROOT=$(findmnt -T "$CHECK_DIR" -no TARGET 2>/dev/null || echo "/")
-    if [[ "$MOUNT_ROOT" == "/" ]]; then
-        warn "'${NAS_BACKUP_ROOT}' resolves to your local root filesystem (/)."
-        warn "If this is supposed to be an NFS ZFS mount, ensure it is mounted first!"
-        if ! ask_yes_no "Proceed with '${NAS_BACKUP_ROOT}' anyway?" "N"; then
-            continue
-        fi
-    else
-        ok "Verified '${NAS_BACKUP_ROOT}' resides on active mount point '${MOUNT_ROOT}'."
-    fi
 
-    if ! mkdir -p "${NAS_BACKUP_ROOT}/${APP_NAME}" 2>/dev/null; then
-        err "Permission denied creating '${NAS_BACKUP_ROOT}/${APP_NAME}'."
-        info "On your host, run: sudo mkdir -p '${NAS_BACKUP_ROOT}' && sudo chown -R ${USER}:${USER} '${NAS_BACKUP_ROOT}'"
-        if ask_yes_no "Retry after fixing permissions?" "Y"; then
-            continue
-        else
-            exit 1
-        fi
-    fi
-
-    touch "${NAS_BACKUP_ROOT}/.backup-target-verified"
-    ok "NAS backup target verified and writable."
-    break
-done
 # Prompt 3: Port Selection (displays default & checks if occupied)
 while true; do
     echo ""
@@ -377,26 +564,31 @@ if ask_yes_no "Set lower CPU & I/O priority (Nice=10, CPUWeight=50) so scans/tra
     LOW_PRIORITY=true
 fi
 
-# Prompt 6: NAS Retention Days (auto-detects existing setting or defaults to)
-DEFAULT_RETENTION=30
-EXISTING_SYNC_SCRIPT="${HOME}/containers/shared-scripts/nas-backup-sync.sh"
-if [[ -f "$EXISTING_SYNC_SCRIPT" ]]; then
-    DETECTED_RETENTION=$(grep -E '^RETENTION_DAYS=' "$EXISTING_SYNC_SCRIPT" 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'" || true)
-    if [[ "$DETECTED_RETENTION" =~ ^[0-9]+$ ]]; then
-        DEFAULT_RETENTION="$DETECTED_RETENTION"
-    fi
+# Prompt 6: Backup Retention Count (5 for network NAS, 2 for local drive/staging)
+if [[ "$ENABLE_STAGE2" == true && "$BACKUP_IS_NETWORK" == true ]]; then
+    DEFAULT_KEEP_NAS=5
+else
+    DEFAULT_KEEP_NAS=2
 fi
 
 echo ""
-read -rp "$(echo -e "${BOLD}Days to retain backups on NAS/ZFS warehouse [${DEFAULT_RETENTION}]: ${NC}")" NAS_RETENTION_DAYS
-NAS_RETENTION_DAYS="${NAS_RETENTION_DAYS:-$DEFAULT_RETENTION}"
+if [[ "$ENABLE_STAGE2" == true ]]; then
+    read -rp "$(echo -e "${BOLD}Max backup archives to keep per container on Stage 2 target [${DEFAULT_KEEP_NAS}]: ${NC}")" NAS_KEEP_COUNT
+else
+    read -rp "$(echo -e "${BOLD}Max local staging backup archives to keep [${DEFAULT_KEEP_NAS}]: ${NC}")" NAS_KEEP_COUNT
+fi
+NAS_KEEP_COUNT="${NAS_KEEP_COUNT:-$DEFAULT_KEEP_NAS}"
 
 # Pre-Install Review Summary
 echo -e "\n${BOLD}--- Configuration Summary ---${NC}"
 echo "  Instance Name:   ${APP_NAME}"
 echo "  Web UI Port:     ${JELLYFIN_PORT}"
 echo "  Media Path:      ${MEDIA_PATH} (${MEDIA_FSTYPE})"
-echo "  NAS Backup Path: ${NAS_BACKUP_ROOT}/${APP_NAME} (Retain: ${NAS_RETENTION_DAYS} days)"
+if [[ "$ENABLE_STAGE2" == true ]]; then
+    echo "  Stage 2 Backup:  ${NAS_BACKUP_ROOT}/${APP_NAME} (Retain: ${NAS_KEEP_COUNT} backups)"
+else
+    echo "  Stage 2 Backup:  Disabled (Local staging only, retain: ${NAS_KEEP_COUNT} backups)"
+fi
 echo "  GPU Passthrough: ${ENABLE_GPU}"
 echo "  Low CPU/IO Prio: ${LOW_PRIORITY}"
 echo ""
@@ -404,6 +596,7 @@ if ! ask_yes_no "Proceed with creating directories, Quadlet, and backup timers?"
     info "Aborted safely before making any system changes."
     exit 0
 fi
+
 
 # ==============================================================================
 # 4. CREATE DIRECTORY STRUCTURE
@@ -422,7 +615,9 @@ mkdir -p \
     "${APP_DIR}/cache" \
     "${APP_DIR}/scripts" \
     "$SHARED_SCRIPTS_DIR" \
-    "$STAGING_APP"
+    "$STAGING_APP" \
+    "${STAGING_ROOT}/.tmp"
+
 
 # ==============================================================================
 # 5. WRITE QUADLET FILE (~/.config/containers/systemd/)
@@ -449,6 +644,7 @@ Wants=network-online.target
 Image=docker.io/jellyfin/jellyfin:latest
 ContainerName=${APP_NAME}
 AutoUpdate=registry
+Timezone=local
 
 # Networking
 PublishPort=${JELLYFIN_PORT}:8096
@@ -484,10 +680,12 @@ APP_NAME="${APP_NAME}"
 CONFIG_PARENT="\${HOME}/containers/\${APP_NAME}"
 STAGING_ROOT="\${HOME}/backups/staging"
 STAGING_DIR="\${STAGING_ROOT}/\${APP_NAME}"
+TMP_DIR="\${STAGING_ROOT}/.tmp"
 COUNT_FILE="\${STAGING_ROOT}/.\${APP_NAME}-backup.count"
-KEEP_LOCAL=2
+KEEP_LOCAL=$( [[ "$ENABLE_STAGE2" == true ]] && echo 1 || echo "$NAS_KEEP_COUNT" )
 
-mkdir -p "\$STAGING_DIR"
+
+mkdir -p "\$STAGING_DIR" "\$TMP_DIR"
 
 LAST_NUM=0
 if [[ -f "\$COUNT_FILE" ]]; then
@@ -499,22 +697,41 @@ SEQ_TAG=\$(printf "b%04d" "\$NEXT_NUM")
 DATE_TAG=\$(date +%F)
 
 ARCHIVE_NAME="\${APP_NAME}_\${DATE_TAG}_\${SEQ_TAG}.tar.gz"
-TMP_ARCHIVE="/tmp/\${ARCHIVE_NAME}"
+TMP_ARCHIVE="\${TMP_DIR}/\${ARCHIVE_NAME}"
 FINAL_ARCHIVE="\${STAGING_DIR}/\${ARCHIVE_NAME}"
 
-echo "[\$(date -Is)] Starting cold-stop backup: \${ARCHIVE_NAME}"
+echo "[\$(date -Is)] Starting backup: \${ARCHIVE_NAME}"
 
-restart_service() {
-    echo "[\$(date -Is)] Starting \${APP_NAME}.service..."
-    systemctl --user start "\${APP_NAME}.service"
+# Check if container was running before backup so we never wake a manually stopped container
+WAS_RUNNING=false
+if systemctl --user is-active --quiet "\${APP_NAME}.service"; then
+    WAS_RUNNING=true
+fi
+
+cleanup_on_exit() {
+    rm -f "\$TMP_ARCHIVE"
+    if [[ "\$WAS_RUNNING" == true ]]; then
+        echo "[\$(date -Is)] Restarting \${APP_NAME}.service..."
+        systemctl --user start "\${APP_NAME}.service"
+    fi
 }
-trap restart_service EXIT
+trap cleanup_on_exit EXIT
 
-systemctl --user stop "\${APP_NAME}.service"
+if [[ "\$WAS_RUNNING" == true ]]; then
+    echo "[\$(date -Is)] Stopping \${APP_NAME}.service for cold backup..."
+    systemctl --user stop "\${APP_NAME}.service"
+else
+    echo "[\$(date -Is)] \${APP_NAME}.service is already stopped; backing up cold config without restarting."
+fi
+
 tar -czf "\$TMP_ARCHIVE" -C "\$CONFIG_PARENT" config
 mv "\$TMP_ARCHIVE" "\$FINAL_ARCHIVE"
 
-restart_service
+# Normal completion: restart service only if it was running, then clear the exit trap
+if [[ "\$WAS_RUNNING" == true ]]; then
+    echo "[\$(date -Is)] Restarting \${APP_NAME}.service..."
+    systemctl --user start "\${APP_NAME}.service"
+fi
 trap - EXIT
 
 echo "[\$(date -Is)] Backup saved to \${FINAL_ARCHIVE} (\$(du -h "\$FINAL_ARCHIVE" | cut -f1))"
@@ -551,11 +768,13 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+
 # ==============================================================================
 # 7. WRITE STAGE 2 CENTRALIZED NAS SYNC SCRIPT & SYSTEMD UNITS (02:30 AM)
 # ==============================================================================
 info "Configuring Stage 2 centralized NAS sync service & timer (02:30 AM daily)..."
-
+if [[ "$ENABLE_STAGE2" == true ]]; then
+    
 cat > "${SHARED_SCRIPTS_DIR}/nas-backup-sync.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -563,7 +782,7 @@ set -euo pipefail
 STAGING_ROOT="\${HOME}/backups/staging"
 NAS_BACKUP_ROOT="${NAS_BACKUP_ROOT}"
 MOUNT_ROOT="${MOUNT_ROOT}"
-RETENTION_DAYS=${NAS_RETENTION_DAYS}
+KEEP_NAS=${NAS_KEEP_COUNT}
 
 echo "[\$(date -Is)] Starting Stage 2 NAS sync -> \${NAS_BACKUP_ROOT}"
 
@@ -577,13 +796,31 @@ if [[ ! -f "\${NAS_BACKUP_ROOT}/.backup-target-verified" ]]; then
     exit 1
 fi
 
+# Free-space safety check: require at least 2 GB (2097152 KB) available on the destination
+AVAIL_KB=\$(df -Pk "\${NAS_BACKUP_ROOT}" | awk 'NR==2 {print \$4}')
+MIN_FREE_KB=2097152
+if [[ -n "\$AVAIL_KB" ]] && (( AVAIL_KB < MIN_FREE_KB )); then
+    AVAIL_MB=\$(( AVAIL_KB / 1024 ))
+    echo "[\$(date -Is)] ERROR: Low disk space on '\${NAS_BACKUP_ROOT}' (\${AVAIL_MB} MB free; 2048 MB required). Aborting sync!" >&2
+    exit 1
+fi
+
+
 rsync -av --ignore-existing --exclude='.*' "\${STAGING_ROOT}/" "\${NAS_BACKUP_ROOT}/"
 if [[ -f "\${STAGING_ROOT}/HOW_TO_RESTORE.txt" ]]; then
     cp -f "\${STAGING_ROOT}/HOW_TO_RESTORE.txt" "\${NAS_BACKUP_ROOT}/HOW_TO_RESTORE.txt"
 fi
 
-if [[ "\$RETENTION_DAYS" -gt 0 ]]; then
-    find "\${NAS_BACKUP_ROOT}" -type f -name "*.tar.gz" -mtime +"${NAS_RETENTION_DAYS}" -delete
+# Keep only the newest KEEP_NAS archives inside each app subfolder on the NAS
+if [[ "\$KEEP_NAS" -gt 0 ]]; then
+    for APP_FOLDER in "\${NAS_BACKUP_ROOT}"/*/; do
+        [[ -d "\$APP_FOLDER" ]] || continue
+        mapfile -t OLD_NAS_FILES < <(ls -1t "\${APP_FOLDER}"*.tar.gz 2>/dev/null | tail -n +\$((KEEP_NAS + 1)))
+        if [[ \${#OLD_NAS_FILES[@]} -gt 0 ]]; then
+            echo "[\$(date -Is)] Pruning \${#OLD_NAS_FILES[@]} old archive(s) in \${APP_FOLDER}..."
+            rm -f "\${OLD_NAS_FILES[@]}"
+        fi
+    done
 fi
 
 echo "[\$(date -Is)] Stage 2 NAS sync complete."
@@ -611,6 +848,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+fi
 
 # ==============================================================================
 # 8. GENERATE SELF-DOCUMENTING HOW_TO_RESTORE.txt IN BOTH PARENT DIRECTORIES
@@ -680,7 +918,10 @@ MANUAL BACKUP & LOG COMMANDS
 ================================================================================
 EOF
 
-cp -f "${STAGING_ROOT}/HOW_TO_RESTORE.txt" "${NAS_BACKUP_ROOT}/HOW_TO_RESTORE.txt"
+if [[ "$ENABLE_STAGE2" == true ]]; then
+    cp -f "${STAGING_ROOT}/HOW_TO_RESTORE.txt" "${NAS_BACKUP_ROOT}/HOW_TO_RESTORE.txt"
+fi
+
 
 # ==============================================================================
 # 9. RELOAD SYSTEMD, ENABLE TIMERS & VERIFY CONTAINER STARTUP
@@ -688,7 +929,9 @@ cp -f "${STAGING_ROOT}/HOW_TO_RESTORE.txt" "${NAS_BACKUP_ROOT}/HOW_TO_RESTORE.tx
 info "Reloading systemd user daemon and enabling backup timers..."
 systemctl --user daemon-reload
 systemctl --user enable --now "${APP_NAME}-backup.timer"
-systemctl --user enable --now nas-backup-sync.timer
+if [[ "$ENABLE_STAGE2" == true ]]; then
+    systemctl --user enable --now nas-backup-sync.timer
+fi
 
 info "Pulling Jellyfin image and starting ${APP_NAME}.service (this may take a minute on first run)..."
 systemctl --user start "${APP_NAME}.service"
@@ -715,7 +958,10 @@ if [[ "$READY" == true ]]; then
     echo ""
     echo -e "${BOLD}Open Jellyfin Setup Wizard (Ctrl+Click or copy URL):${NC}"
     echo "  Local:   ${LOCAL_URL}"
-    [[ -n "$NET_URL" ]] && echo "  Network: ${NET_URL}"
+    if [[ -n "$NET_URL" ]]; then
+        echo "  Network: ${NET_URL}"
+        echo "           (If unreachable from other devices, allow port ${JELLYFIN_PORT}/tcp in your firewall)"
+    fi
     echo ""
     echo -e "${BOLD}Recommended Post-Wizard Settings Inside Jellyfin:${NC}"
     echo "  1. Dashboard -> Libraries -> (3-dot menu) -> Manage library:"
@@ -723,11 +969,14 @@ if [[ "$READY" == true ]]; then
     echo "     - Check 'Save artwork into media folders'"
     echo "  2. Test your backup pipeline right now:"
     echo "     systemctl --user start ${APP_NAME}-backup.service"
-    echo "     systemctl --user start nas-backup-sync.service"
+    if [[ "$ENABLE_STAGE2" == true ]]; then
+        echo "     systemctl --user start nas-backup-sync.service"
+    fi
 else
     warn "${APP_NAME} container started, but port ${JELLYFIN_PORT} did not respond within 90 seconds."
     warn "It may still be initializing. Check status with: journalctl --user -u ${APP_NAME} -f"
 fi
+
 
 # ==============================================================================
 # 10. OPTIONAL SELF-CLEANUP
