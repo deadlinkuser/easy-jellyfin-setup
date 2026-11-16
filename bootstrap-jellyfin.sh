@@ -5,17 +5,49 @@
 # Features:
 #   - Cross-distro OS & Podman >= 4.4 gatekeeper (/etc/os-release)
 #   - Rootless user check, /etc/subuid validation & smart loginctl linger prompt
-#   - Configurable Instance/Container Name (supports side-by-side test instances)
-#   - Smart NFS detection (auto-omits :Z on NFS, checks SELinux virt_use_nfs)
-#   - Optional GPU transcoding (/dev/dri + GroupAdd=keep-groups) & CPU/IO priority
-#   - Stage 1 (02:00): Atomic cold-stop backup -> <name>_YYYY-MM-DD_b0001.tar.gz (keep 1, NAS keep 5)
-#   - Stage 2 (02:30): Centralized ZFS NFS sync (--ignore-existing, mount guard)
-#   - Generates HOW_TO_RESTORE.txt in both local staging and NAS backup roots
+#   - Built-in --uninstall [instance_name] teardown with zero hanging timers
+#   - Configurable Instance/Container Name (supports upgrades & side-by-side)
+#   - Multi-storage detection: Local (:Z), Samba/SMB, and NFS + manual fallback
+#   - Optional GPU transcoding (/dev/dri + GroupAdd=keep-groups), Timezone=local,
+#     and CPU/IO priority controls
+#   - Stage 1 (02:00): Cold-stop config backup via local .tmp staging +
+#     WAS_RUNNING check so manually stopped containers stay stopped
+#   - Stage 2 (02:30, Optional): Centralized rsync to NAS/SMB/local drive with
+#     mount guard, 2 GB free-space check, and count-based rotation (default 5/2)
+#   - Generates HOW_TO_RESTORE.txt in both local staging and Stage 2 backup roots
 #   - Verifies live HTTP response and optionally self-deletes
 # ==============================================================================
 
 set -euo pipefail
 
+# --- Formatting Helpers ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok()    { echo -e "${GREEN}[OK]${NC}   $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err()   { echo -e "${RED}[ERR]${NC}  $*" >&2; }
+
+ask_yes_no() {
+    local prompt="$1"
+    local default="${2:-Y}"
+    local reply
+    if [[ "$default" == "Y" ]]; then
+        read -rp "$(echo -e "${BOLD}${prompt} [Y/n]: ${NC}")" reply
+        reply="${reply:-Y}"
+    else
+        read -rp "$(echo -e "${BOLD}${prompt} [y/N]: ${NC}")" reply
+        reply="${reply:-N}"
+    fi
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# --- Argument Parsing ---
 KEEP_SCRIPT=false
 UNINSTALL_MODE=false
 UNINSTALL_TARGET=""
@@ -46,34 +78,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-
-# --- Formatting Helpers ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
-ok()    { echo -e "${GREEN}[OK]${NC}   $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()   { echo -e "${RED}[ERR]${NC}  $*" >&2; }
-
-ask_yes_no() {
-    local prompt="$1"
-    local default="${2:-Y}"
-    local reply
-    if [[ "$default" == "Y" ]]; then
-        read -rp "$(echo -e "${BOLD}${prompt} [Y/n]: ${NC}")" reply
-        reply="${reply:-Y}"
-    else
-        read -rp "$(echo -e "${BOLD}${prompt} [y/N]: ${NC}")" reply
-        reply="${reply:-N}"
-    fi
-    [[ "$reply" =~ ^[Yy]$ ]]
-}
 
 # ==============================================================================
 # 0. BUILT-IN UNINSTALLER (--uninstall)
@@ -115,21 +119,16 @@ if [[ "$UNINSTALL_MODE" == true ]]; then
         exit 0
     fi
 
-    # 1. Stop and disable Stage 1 backup timer & service
     info "Stopping and disabling ${APP_NAME} timers and container..."
     systemctl --user disable --now "${APP_NAME}-backup.timer" 2>/dev/null || true
     systemctl --user stop "${APP_NAME}-backup.service" 2>/dev/null || true
-
-    # 2. Stop the container service
     systemctl --user stop "${APP_NAME}.service" 2>/dev/null || true
 
-    # 3. Delete unit & Quadlet files so nothing can ever auto-start again
     rm -f \
         "${QUADLET_DIR}/${APP_NAME}.container" \
         "${SYSTEMD_USER_DIR}/${APP_NAME}-backup.timer" \
         "${SYSTEMD_USER_DIR}/${APP_NAME}-backup.service"
 
-    # 4. Check if any OTHER app backup timers remain; if none, disable shared Stage 2 NAS timer
     REMAINING_TIMERS=$(find "$SYSTEMD_USER_DIR" -maxdepth 1 -name "*-backup.timer" 2>/dev/null | wc -l)
     if [[ "$REMAINING_TIMERS" -eq 0 && -f "${SYSTEMD_USER_DIR}/nas-backup-sync.timer" ]]; then
         info "No other container backup timers remain."
@@ -144,12 +143,10 @@ if [[ "$UNINSTALL_MODE" == true ]]; then
         fi
     fi
 
-    # 5. Reload systemd and clear any failed state so no ghost units remain
     systemctl --user daemon-reload
     systemctl --user reset-failed 2>/dev/null || true
     ok "All systemd units and timers for '${APP_NAME}' have been cleanly removed."
 
-    # 6. Optional data cleanup (kept separate so users never lose config/backups by accident)
     echo ""
     if [[ -d "$APP_DIR" ]]; then
         if ask_yes_no "Delete container config & cache directory (${APP_DIR})? (No = keep data)" "N"; then
@@ -173,7 +170,6 @@ if [[ "$UNINSTALL_MODE" == true ]]; then
     ok "Uninstall of '${APP_NAME}' complete! (Your media files and NAS backups were untouched.)"
     exit 0
 fi
-
 
 # ==============================================================================
 # 1. HARD BLOCKERS & OS GATEKEEPER
@@ -266,6 +262,7 @@ else
         exit 0
     fi
 fi
+
 # ==============================================================================
 # 2. DEPENDENCY, PODMAN VERSION, SUBUID & LINGER CHECKS
 # ==============================================================================
@@ -326,7 +323,7 @@ echo -e "\n${BOLD}--- Instance, Storage, Backup & Hardware Prompts ---${NC}"
 QUADLET_DIR="${HOME}/.config/containers/systemd"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 
-# Prompt 0: Container / Instance Name (allows side-by-side installs)
+# Prompt 0: Container / Instance Name (supports upgrades & side-by-side installs)
 DEFAULT_APP_NAME="jellyfin"
 while true; do
     read -rp "$(echo -e "${BOLD}Container / Quadlet instance name [${DEFAULT_APP_NAME}]: ${NC}")" APP_NAME
@@ -338,9 +335,12 @@ while true; do
     fi
 
     if [[ -f "${QUADLET_DIR}/${APP_NAME}.container" || -d "${HOME}/containers/${APP_NAME}" ]]; then
-        warn "An instance named '${APP_NAME}' already exists (${QUADLET_DIR}/${APP_NAME}.container or ~/containers/${APP_NAME})."
-        if ! ask_yes_no "Overwrite existing '${APP_NAME}' Quadlet & backup units?" "N"; then
-            info "Tip: Choose a distinct name such as 'jellyfin-test' to run side-by-side."
+        warn "An existing '${APP_NAME}' setup was found on this host."
+        echo "  * Answer 'Y' to replace/update the Quadlet & backup timers in place"
+        echo "    (your existing ~/containers/${APP_NAME}/config data will be kept)."
+        echo "  * Answer 'N' to enter a different name (e.g., '${APP_NAME}-test') for a"
+        echo "    separate side-by-side instance."
+        if ! ask_yes_no "Replace/update existing '${APP_NAME}' units and timers?" "N"; then
             continue
         fi
     fi
@@ -349,6 +349,15 @@ while true; do
 done
 
 # Prompt 1: Media Path
+ACTIVE_NET_MOUNTS=$(findmnt -rn -t nfs,nfs4,cifs,smb3 -o TARGET,FSTYPE 2>/dev/null || true)
+if [[ -n "$ACTIVE_NET_MOUNTS" ]]; then
+    echo ""
+    info "Active network mounts detected on this host:"
+    while IFS= read -r line; do
+        echo "    -> $line"
+    done <<< "$ACTIVE_NET_MOUNTS"
+fi
+
 DEFAULT_MEDIA="/mnt/media/data"
 while true; do
     echo ""
@@ -428,7 +437,6 @@ case "$MEDIA_FSTYPE" in
         ;;
 esac
 
-
 # Prompt 2: Stage 2 Backup Destination (Optional for single-drive / local-only users)
 ENABLE_STAGE2=false
 BACKUP_IS_NETWORK=false
@@ -443,6 +451,14 @@ if ask_yes_no "Enable Stage 2 off-site/NAS backup sync (recommended if you have 
     if [[ -f "$EXISTING_SYNC_SCRIPT" ]]; then
         DETECTED_NAS=$(grep -E '^NAS_BACKUP_ROOT=' "$EXISTING_SYNC_SCRIPT" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
         [[ -n "$DETECTED_NAS" ]] && DEFAULT_NAS_BACKUP="$DETECTED_NAS"
+    fi
+
+    if [[ -n "$ACTIVE_NET_MOUNTS" ]]; then
+        echo ""
+        info "Active network mounts available on this host:"
+        while IFS= read -r line; do
+            echo "    -> $line"
+        done <<< "$ACTIVE_NET_MOUNTS"
     fi
 
     BACKUP_IS_NETWORK=true
@@ -467,20 +483,27 @@ if ask_yes_no "Enable Stage 2 off-site/NAS backup sync (recommended if you have 
                 ;;
             *)
                 if [[ "$MOUNT_ROOT" == "/" ]]; then
-                    warn "'${NAS_BACKUP_ROOT}' resolves to your local root filesystem (/)."
-                    echo "Is this intended to be:"
-                    echo "  1) A network share (NFS/SMB) that isn't mounted yet  [abort & mount first]"
-                    echo "  2) Intentional local storage on this machine         [skip mount check, lower retention]"
-                    read -rp "$(echo -e "${BOLD}Select [1-2, default 1]: ${NC}")" BACKUP_LOC_CHOICE
-                    if [[ "${BACKUP_LOC_CHOICE:-1}" == "2" ]]; then
-                        BACKUP_IS_NETWORK=false
-                        MOUNT_ROOT="/"
-                        warn "Using local storage for Stage 2 backups (protects against config corruption, not drive failure)."
-                    else
-                        continue
-                    fi
+                    warn "'${NAS_BACKUP_ROOT}' resolves to your local OS drive (/), not a mounted share."
+                    echo "How would you like to proceed?"
+                    echo "  1) Exit now so I can mount my network share (NFS/SMB) first"
+                    echo "  2) Re-enter a different path (e.g., I made a typo or want a detected mount above)"
+                    echo "  3) Use this local folder intentionally (skips mount check, keeps 2 backups)"
+                    read -rp "$(echo -e "${BOLD}Select [1-3, default 1]: ${NC}")" BACKUP_LOC_CHOICE
+                    case "${BACKUP_LOC_CHOICE:-1}" in
+                        2)
+                            continue
+                            ;;
+                        3)
+                            BACKUP_IS_NETWORK=false
+                            MOUNT_ROOT="/"
+                            warn "Using local storage for Stage 2 backups (protects against config corruption, not drive failure)."
+                            ;;
+                        *)
+                            info "Aborted safely. Mount your NFS/SMB share first, then re-run $(basename "$0")."
+                            exit 0
+                            ;;
+                    esac
                 else
-                    # Separate local partition/drive (e.g. /mnt/backup-ssd)
                     BACKUP_IS_NETWORK=false
                     ok "Detected separate local mount '${MOUNT_ROOT}' (${BACKUP_FSTYPE})."
                 fi
@@ -505,17 +528,16 @@ else
     info "Stage 2 NAS sync skipped. Backups will stay in local staging (${HOME}/backups/staging/${APP_NAME})."
 fi
 
-
 # Prompt 3: Port Selection (displays default & checks if occupied)
 while true; do
     echo ""
-    read -rp "$(echo -e "${BOLD}Host HTTP port for ${APP_NAME} web UI: ${NC}")" JELLYFIN_PORT
+    read -rp "$(echo -e "${BOLD}Host HTTP port for ${APP_NAME} web UI [8096]: ${NC}")" JELLYFIN_PORT
     JELLYFIN_PORT="${JELLYFIN_PORT:-8096}"
     if [[ ! "$JELLYFIN_PORT" =~ ^[0-9]+$ ]] || (( JELLYFIN_PORT < 1024 || JELLYFIN_PORT > 65535 )); then
         err "Please enter a valid unprivileged port number (1024-65535)."
         continue
     fi
-    if ss -tln 2>/dev/null | grep -qE ":${JELLYFIN_PORT}"; then
+    if ss -tln 2>/dev/null | grep -qE ":${JELLYFIN_PORT} "; then
         warn "Port ${JELLYFIN_PORT} is ALREADY in use on this host!"
         if ! ask_yes_no "Use port ${JELLYFIN_PORT} anyway?" "N"; then
             continue
@@ -597,7 +619,6 @@ if ! ask_yes_no "Proceed with creating directories, Quadlet, and backup timers?"
     exit 0
 fi
 
-
 # ==============================================================================
 # 4. CREATE DIRECTORY STRUCTURE
 # ==============================================================================
@@ -617,7 +638,6 @@ mkdir -p \
     "$SHARED_SCRIPTS_DIR" \
     "$STAGING_APP" \
     "${STAGING_ROOT}/.tmp"
-
 
 # ==============================================================================
 # 5. WRITE QUADLET FILE (~/.config/containers/systemd/)
@@ -683,7 +703,6 @@ STAGING_DIR="\${STAGING_ROOT}/\${APP_NAME}"
 TMP_DIR="\${STAGING_ROOT}/.tmp"
 COUNT_FILE="\${STAGING_ROOT}/.\${APP_NAME}-backup.count"
 KEEP_LOCAL=$( [[ "$ENABLE_STAGE2" == true ]] && echo 1 || echo "$NAS_KEEP_COUNT" )
-
 
 mkdir -p "\$STAGING_DIR" "\$TMP_DIR"
 
@@ -772,10 +791,10 @@ EOF
 # ==============================================================================
 # 7. WRITE STAGE 2 CENTRALIZED NAS SYNC SCRIPT & SYSTEMD UNITS (02:30 AM)
 # ==============================================================================
-info "Configuring Stage 2 centralized NAS sync service & timer (02:30 AM daily)..."
 if [[ "$ENABLE_STAGE2" == true ]]; then
-    
-cat > "${SHARED_SCRIPTS_DIR}/nas-backup-sync.sh" <<EOF
+    info "Configuring Stage 2 centralized NAS sync service & timer (02:30 AM daily)..."
+
+    cat > "${SHARED_SCRIPTS_DIR}/nas-backup-sync.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -805,7 +824,6 @@ if [[ -n "\$AVAIL_KB" ]] && (( AVAIL_KB < MIN_FREE_KB )); then
     exit 1
 fi
 
-
 rsync -av --ignore-existing --exclude='.*' "\${STAGING_ROOT}/" "\${NAS_BACKUP_ROOT}/"
 if [[ -f "\${STAGING_ROOT}/HOW_TO_RESTORE.txt" ]]; then
     cp -f "\${STAGING_ROOT}/HOW_TO_RESTORE.txt" "\${NAS_BACKUP_ROOT}/HOW_TO_RESTORE.txt"
@@ -826,9 +844,9 @@ fi
 echo "[\$(date -Is)] Stage 2 NAS sync complete."
 EOF
 
-chmod +x "${SHARED_SCRIPTS_DIR}/nas-backup-sync.sh"
+    chmod +x "${SHARED_SCRIPTS_DIR}/nas-backup-sync.sh"
 
-cat > "${SYSTEMD_USER_DIR}/nas-backup-sync.service" <<EOF
+    cat > "${SYSTEMD_USER_DIR}/nas-backup-sync.service" <<EOF
 [Unit]
 Description=Centralized Stage 2 Container Backup Sync to NAS
 
@@ -837,7 +855,7 @@ Type=oneshot
 ExecStart=%h/containers/shared-scripts/nas-backup-sync.sh
 EOF
 
-cat > "${SYSTEMD_USER_DIR}/nas-backup-sync.timer" <<EOF
+    cat > "${SYSTEMD_USER_DIR}/nas-backup-sync.timer" <<EOF
 [Unit]
 Description=Daily Stage 2 NAS Backup Sync (02:30 AM)
 
@@ -853,7 +871,7 @@ fi
 # ==============================================================================
 # 8. GENERATE SELF-DOCUMENTING HOW_TO_RESTORE.txt IN BOTH PARENT DIRECTORIES
 # ==============================================================================
-info "Writing HOW_TO_RESTORE.txt to local staging and NAS backup roots..."
+info "Writing HOW_TO_RESTORE.txt to local staging and Stage 2 backup roots..."
 
 cat > "${STAGING_ROOT}/HOW_TO_RESTORE.txt" <<EOF
 ================================================================================
@@ -863,7 +881,7 @@ Generated for user: ${USER}
 Instance name:      ${APP_NAME}
 Host media path:    ${MEDIA_PATH}  (Mounted inside container as /media)
 Local staging path: ${STAGING_APP}
-NAS backup path:    ${NAS_BACKUP_ROOT}/${APP_NAME}
+Stage 2 path:       ${NAS_BACKUP_ROOT:-Disabled (Single-Stage Local Only)}
 
 --------------------------------------------------------------------------------
 SCENARIO A: RESTORE CONFIGURATION / DATABASE ON EXISTING SERVER
@@ -905,7 +923,7 @@ SCENARIO B: FULL REBUILD ON A BRAND-NEW LINUX INSTALL
 
 5. Restore your Quadlet and backup timer units, then start the service:
      systemctl --user daemon-reload
-     systemctl --user enable --now ${APP_NAME}-backup.timer nas-backup-sync.timer
+     systemctl --user enable --now ${APP_NAME}-backup.timer
      systemctl --user start ${APP_NAME}.service
 
 --------------------------------------------------------------------------------
@@ -921,7 +939,6 @@ EOF
 if [[ "$ENABLE_STAGE2" == true ]]; then
     cp -f "${STAGING_ROOT}/HOW_TO_RESTORE.txt" "${NAS_BACKUP_ROOT}/HOW_TO_RESTORE.txt"
 fi
-
 
 # ==============================================================================
 # 9. RELOAD SYSTEMD, ENABLE TIMERS & VERIFY CONTAINER STARTUP
@@ -977,7 +994,6 @@ else
     warn "It may still be initializing. Check status with: journalctl --user -u ${APP_NAME} -f"
 fi
 
-
 # ==============================================================================
 # 10. OPTIONAL SELF-CLEANUP
 # ==============================================================================
@@ -993,4 +1009,3 @@ if [[ "$KEEP_SCRIPT" == false ]]; then
 else
     info "Flag --keep passed: keeping $(basename "$0")."
 fi
-
