@@ -1,24 +1,53 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper (v1.4)
+# Jellyfin Rootless Podman Quadlet & Two-Stage Backup Bootstrapper (v1.4.1)
 # ==============================================================================
 # Features:
 #   - Cross-distro OS & Podman >= 4.4 gatekeeper (/etc/os-release)
 #   - Rootless user check, /etc/subuid validation & smart loginctl linger prompt
-#   - Built-in --uninstall [instance_name] teardown with zero hanging timers
-#   - Configurable Instance/Container Name (supports upgrades & side-by-side)
-#   - Multi-storage detection: Local (:Z), Samba/SMB, and NFS + manual fallback
-#   - Optional GPU transcoding (/dev/dri + GroupAdd=keep-groups), Timezone=local,
-#     and CPU/IO priority controls
-#   - Stage 1 (02:00): Cold-stop config backup via local .tmp staging +
-#     WAS_RUNNING check so manually stopped containers stay stopped
-#   - Stage 2 (02:30, Optional): Centralized rsync to NAS/SMB/local drive with
-#     mount guard, 2 GB free-space check, and count-based rotation (default 5/2)
-#   - Generates HOW_TO_RESTORE.txt in both local staging and Stage 2 backup roots
+#   - Configurable Instance/Container Name (supports upgrades & side-by-side installs)
+#   - Multi-storage detection: Local (:Z), Samba/SMB (cifs), and NFS + manual fallback
+#   - Optional GPU transcoding (/dev/dri + GroupAdd=keep-groups) & CPU/IO priority
+#   - Restart=on-failure so manual Podman Desktop / systemctl stops stay stopped
+#   - Stage 1 (02:00): Atomic cold-stop backup -> <name>_YYYY-MM-DD_b0001.tar.gz
+#   - Stage 2 (02:30, Optional): Centralized sync with 2 GB free-space guard & count rotation
+#   - Built-in --uninstall [instance_name] with zero hanging timers
+#   - Generates HOW_TO_RESTORE.txt tailored to single- or two-stage setup
 #   - Verifies live HTTP response and optionally self-deletes
 # ==============================================================================
 
 set -euo pipefail
+
+KEEP_SCRIPT=false
+UNINSTALL_MODE=false
+UNINSTALL_TARGET=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --keep|--no-self-delete)
+            KEEP_SCRIPT=true
+            shift
+            ;;
+        --uninstall)
+            UNINSTALL_MODE=true
+            if [[ -n "${2:-}" && ! "${2:-}" =~ ^- ]]; then
+                UNINSTALL_TARGET="$2"
+                shift
+            fi
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--keep] [--uninstall [instance_name]]"
+            echo "  --keep                      Do not offer to delete this script after verification."
+            echo "  --uninstall [instance_name] Cleanly stop and remove a Jellyfin instance and its timers."
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1 (use --help for usage)" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # --- Formatting Helpers ---
 RED='\033[0;31m'
@@ -46,38 +75,6 @@ ask_yes_no() {
     fi
     [[ "$reply" =~ ^[Yy]$ ]]
 }
-
-# --- Argument Parsing ---
-KEEP_SCRIPT=false
-UNINSTALL_MODE=false
-UNINSTALL_TARGET=""
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --keep|--no-self-delete)
-            KEEP_SCRIPT=true
-            shift
-            ;;
-        --uninstall)
-            UNINSTALL_MODE=true
-            if [[ -n "${2:-}" && ! "${2:-}" =~ ^- ]]; then
-                UNINSTALL_TARGET="$2"
-                shift
-            fi
-            shift
-            ;;
-        -h|--help)
-            echo "Usage: $0 [--keep] [--uninstall [instance_name]]"
-            echo "  --keep                      Do not offer to delete this script after verification."
-            echo "  --uninstall [instance_name] Cleanly stop and remove a Jellyfin instance and its timers."
-            exit 0
-            ;;
-        *)
-            err "Unknown option: $1 (use --help for usage)"
-            exit 1
-            ;;
-    esac
-done
 
 # ==============================================================================
 # 0. BUILT-IN UNINSTALLER (--uninstall)
@@ -119,16 +116,21 @@ if [[ "$UNINSTALL_MODE" == true ]]; then
         exit 0
     fi
 
+    # 1. Stop and disable Stage 1 backup timer & service
     info "Stopping and disabling ${APP_NAME} timers and container..."
     systemctl --user disable --now "${APP_NAME}-backup.timer" 2>/dev/null || true
     systemctl --user stop "${APP_NAME}-backup.service" 2>/dev/null || true
+
+    # 2. Stop the container service
     systemctl --user stop "${APP_NAME}.service" 2>/dev/null || true
 
+    # 3. Delete unit & Quadlet files so nothing can ever auto-start again
     rm -f \
         "${QUADLET_DIR}/${APP_NAME}.container" \
         "${SYSTEMD_USER_DIR}/${APP_NAME}-backup.timer" \
         "${SYSTEMD_USER_DIR}/${APP_NAME}-backup.service"
 
+    # 4. Check if any OTHER app backup timers remain; if none, disable shared Stage 2 NAS timer
     REMAINING_TIMERS=$(find "$SYSTEMD_USER_DIR" -maxdepth 1 -name "*-backup.timer" 2>/dev/null | wc -l)
     if [[ "$REMAINING_TIMERS" -eq 0 && -f "${SYSTEMD_USER_DIR}/nas-backup-sync.timer" ]]; then
         info "No other container backup timers remain."
@@ -143,10 +145,12 @@ if [[ "$UNINSTALL_MODE" == true ]]; then
         fi
     fi
 
+    # 5. Reload systemd and clear any failed state so no ghost units remain
     systemctl --user daemon-reload
     systemctl --user reset-failed 2>/dev/null || true
     ok "All systemd units and timers for '${APP_NAME}' have been cleanly removed."
 
+    # 6. Optional data cleanup (kept separate so users never lose config/backups by accident)
     echo ""
     if [[ -d "$APP_DIR" ]]; then
         if ask_yes_no "Delete container config & cache directory (${APP_DIR})? (No = keep data)" "N"; then
@@ -504,6 +508,7 @@ if ask_yes_no "Enable Stage 2 off-site/NAS backup sync (recommended if you have 
                             ;;
                     esac
                 else
+                    # Separate local partition/drive (e.g. /mnt/backup-ssd)
                     BACKUP_IS_NETWORK=false
                     ok "Detected separate local mount '${MOUNT_ROOT}' (${BACKUP_FSTYPE})."
                 fi
@@ -531,7 +536,7 @@ fi
 # Prompt 3: Port Selection (displays default & checks if occupied)
 while true; do
     echo ""
-    read -rp "$(echo -e "${BOLD}Host HTTP port for ${APP_NAME} web UI [8096]: ${NC}")" JELLYFIN_PORT
+    read -rp "$(echo -e "${BOLD}Host HTTP port for ${APP_NAME} web UI: ${NC}")" JELLYFIN_PORT
     JELLYFIN_PORT="${JELLYFIN_PORT:-8096}"
     if [[ ! "$JELLYFIN_PORT" =~ ^[0-9]+$ ]] || (( JELLYFIN_PORT < 1024 || JELLYFIN_PORT > 65535 )); then
         err "Please enter a valid unprivileged port number (1024-65535)."
@@ -677,7 +682,7 @@ Volume=${MEDIA_PATH}:/media${MEDIA_VOL_OPTS}
 ${GPU_BLOCK}
 
 [Service]
-Restart=always
+Restart=on-failure
 TimeoutStartSec=300
 ${PRIORITY_BLOCK}
 
@@ -869,9 +874,18 @@ EOF
 fi
 
 # ==============================================================================
-# 8. GENERATE SELF-DOCUMENTING HOW_TO_RESTORE.txt IN BOTH PARENT DIRECTORIES
+# 8. GENERATE SELF-DOCUMENTING HOW_TO_RESTORE.txt
 # ==============================================================================
-info "Writing HOW_TO_RESTORE.txt to local staging and Stage 2 backup roots..."
+info "Writing HOW_TO_RESTORE.txt recovery documentation..."
+
+STAGE2_RESTORE_LINE="Stage 2 backup:     Disabled (Local staging only)"
+STAGE2_TIMER_CMD="systemctl --user enable --now ${APP_NAME}-backup.timer"
+STAGE2_MANUAL_LINE=""
+if [[ "$ENABLE_STAGE2" == true ]]; then
+    STAGE2_RESTORE_LINE="Stage 2 backup:     ${NAS_BACKUP_ROOT}/${APP_NAME}"
+    STAGE2_TIMER_CMD="systemctl --user enable --now ${APP_NAME}-backup.timer nas-backup-sync.timer"
+    STAGE2_MANUAL_LINE=$'  Run Stage 2 NAS sync now: systemctl --user start nas-backup-sync.service\n'
+fi
 
 cat > "${STAGING_ROOT}/HOW_TO_RESTORE.txt" <<EOF
 ================================================================================
@@ -881,7 +895,7 @@ Generated for user: ${USER}
 Instance name:      ${APP_NAME}
 Host media path:    ${MEDIA_PATH}  (Mounted inside container as /media)
 Local staging path: ${STAGING_APP}
-Stage 2 path:       ${NAS_BACKUP_ROOT:-Disabled (Single-Stage Local Only)}
+${STAGE2_RESTORE_LINE}
 
 --------------------------------------------------------------------------------
 SCENARIO A: RESTORE CONFIGURATION / DATABASE ON EXISTING SERVER
@@ -923,15 +937,14 @@ SCENARIO B: FULL REBUILD ON A BRAND-NEW LINUX INSTALL
 
 5. Restore your Quadlet and backup timer units, then start the service:
      systemctl --user daemon-reload
-     systemctl --user enable --now ${APP_NAME}-backup.timer
+     ${STAGE2_TIMER_CMD}
      systemctl --user start ${APP_NAME}.service
 
 --------------------------------------------------------------------------------
 MANUAL BACKUP & LOG COMMANDS
 --------------------------------------------------------------------------------
   Run Stage 1 backup now:   systemctl --user start ${APP_NAME}-backup.service
-  Run Stage 2 NAS sync now: systemctl --user start nas-backup-sync.service
-  Check backup logs:        journalctl --user -u ${APP_NAME}-backup -u nas-backup-sync -n 50
+${STAGE2_MANUAL_LINE}  Check backup logs:        journalctl --user -u ${APP_NAME}-backup -u nas-backup-sync -n 50
   Check container logs:     journalctl --user -u ${APP_NAME} -f
 ================================================================================
 EOF
