@@ -42,7 +42,7 @@ Before running the installer, find the **specific subfolder** that actually cont
 Run the installer as your **standard user** (do **not** run as `root` or with `sudo`):
 
 ```bash
-curl -fsSL https://githubusercontent.com -o ~/easy-jellyfin-setup.sh
+curl -fsSL https://raw.githubusercontent.com/deadlinkuser/easy-jellyfin-setup/main/easy-jellyfin-setup.sh -o ~/easy-jellyfin-setup.sh
 chmod +x ~/easy-jellyfin-setup.sh
 ~/easy-jellyfin-setup.sh --keep
 ```
