@@ -673,7 +673,7 @@ EOF
 
     info "Reloading systemd and starting ${APP_NAME}.service (pulling image on first run)..."
     systemctl --user daemon-reload
-    systemctl --user start "${APP_NAME}.service"
+    systemctl --user start "${APP_NAME}.service"965+
 
 # ==============================================================================
 # 10B. EXECUTE NATIVE INSTALLATION (DEBIAN/UBUNTU OR FEDORA/RHEL)
