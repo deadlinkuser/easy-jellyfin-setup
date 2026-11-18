@@ -215,7 +215,9 @@ run_backup() {
     fi
 
     # Case B: Native System Package Install (/var/lib/jellyfin)
-    if [[ -d "/var/lib/jellyfin" ]] && systemctl list-unit-files jellyfin.service >/dev/null 2>&1; then
+        # Case B: Native System Package Install (/var/lib/jellyfin)
+    if [[ "$app_name" == "jellyfin" && -d "/var/lib/jellyfin" ]] && systemctl list-unit-files jellyfin.service >/dev/null 2>&1; then
+
         mkdir -p "$backup_dir"
         local native_was_running=false
         if systemctl is-active --quiet jellyfin.service; then
@@ -571,7 +573,8 @@ ENABLE_GPU=false
 if [[ "$INSTALL_MODE" == "container" ]]; then
     while true; do
         echo ""
-        read -rp "$(echo -e "${BOLD}Web UI port for ${APP_NAME}: ${NC}")" JELLYFIN_PORT
+                read -rp "$(echo -e "${BOLD}Web UI port for ${APP_NAME} [default 8096]: ${NC}")" JELLYFIN_PORT
+
         JELLYFIN_PORT="${JELLYFIN_PORT:-8096}"
         if [[ ! "$JELLYFIN_PORT" =~ ^[0-9]+$ ]] || (( JELLYFIN_PORT < 1024 || JELLYFIN_PORT > 65535 )); then
             err "Enter a valid port between 1024 and 65535."
@@ -673,7 +676,7 @@ EOF
 
     info "Reloading systemd and starting ${APP_NAME}.service (pulling image on first run)..."
     systemctl --user daemon-reload
-    systemctl --user start "${APP_NAME}.service"965+
+    systemctl --user start "${APP_NAME}.service"
 
 # ==============================================================================
 # 10B. EXECUTE NATIVE INSTALLATION (DEBIAN/UBUNTU OR FEDORA/RHEL)
@@ -704,10 +707,48 @@ else
     fi
 
     # [NOTE] In native mode, Jellyfin runs under the 'jellyfin' system user.
+    #   Using Access Control Lists (setfacl) grants the jellyfin user read/execute
+    #   access to your media folder without changing folder ownership away from you.
+    if [[ "$MEDIA_FSTYPE" != "nfs"* && "$MEDIA_FSTYPE" != "cifs" && "$MEDIA_FSTYPE" != "smb"* ]]; then
+        info "Granting 'jellyfin' user read access to ${MEDIA_PATH} via ACL..."
+        sudo setfacl -R -m u:jellyfin:rx "$MEDIA_PATH" 2>/dev/null || \
+            warn "Could not set ACL on ${MEDIA_PATH}. Ensure the 'jellyfin' user has read permissions."
+        sudo setfacl -R -d -m u:jellyfin:rx "$MEDIA_PATH" 2>/dev/null || true
+    else
+        warn "Network share detected: ensure mount options allow the 'jellyfin' user to read ${MEDIA_PATH}."
+    fi
+
+    # [NOTE] Add the 'jellyfin' system user to video/render groups if GPU hardware
+    #   transcoding was requested.
+    if [[ "$ENABLE_GPU" == true ]]; then
+        for grp in render video; do
+            if getent group "$grp" >/dev/null 2>&1; then
+                sudo usermod -aG "$grp" jellyfin
+            fi
+        done
+    fi
+
+    info "Enabling and starting system jellyfin.service..."
+    sudo systemctl enable --now jellyfin.service
+fi
+
 # ==============================================================================
 # 11. WRITE SIMPLE RESTORE & CLEANUP GUIDE (HOW_TO_RESTORE.txt)
 # ==============================================================================
 mkdir -p "${HOME}/backups/${APP_NAME}"
+if [[ "$INSTALL_MODE" == "container" ]]; then
+    RESTORE_STEPS="     systemctl --user stop ${APP_NAME}.service
+     mv ~/containers/${APP_NAME}/config ~/containers/${APP_NAME}/config.old
+     tar -xzf /path/to/${APP_NAME}_YYYY-MM-DD_HHMM.tar.gz -C ~/containers/${APP_NAME}/
+     systemctl --user start ${APP_NAME}.service"
+else
+    RESTORE_STEPS="     sudo systemctl stop jellyfin.service
+     sudo mv /var/lib/jellyfin /var/lib/jellyfin.old
+     sudo tar -xzf /path/to/${APP_NAME}_YYYY-MM-DD_HHMM.tar.gz -C /var/lib/
+     sudo chown -R jellyfin:jellyfin /var/lib/jellyfin
+     sudo systemctl start jellyfin.service"
+fi
+
 cat > "${HOME}/backups/${APP_NAME}/HOW_TO_RESTORE.txt" <<EOF
 ================================================================================
 JELLYFIN QUICK BACKUP, RESTORE & CLEANUP GUIDE (${APP_NAME})
@@ -722,11 +763,8 @@ Media Path:   ${MEDIA_PATH}
    and restarts Jellyfin. You can copy that .tar.gz file to your NAS or USB
    drive whenever you like.
 
-2. RESTORE FROM A BACKUP ARCHIVE (Container Mode):
-     systemctl --user stop ${APP_NAME}.service
-     mv ~/containers/${APP_NAME}/config ~/containers/${APP_NAME}/config.old
-     tar -xzf /path/to/${APP_NAME}_YYYY-MM-DD_HHMM.tar.gz -C ~/containers/${APP_NAME}/
-     systemctl --user start ${APP_NAME}.service
+2. RESTORE FROM A BACKUP ARCHIVE (${INSTALL_MODE} mode):
+${RESTORE_STEPS}
 
 3. POST-INSTALL CLEANUP:
    * Remove unused/old container images:   podman image prune -f
@@ -734,6 +772,7 @@ Media Path:   ${MEDIA_PATH}
    * Uninstall Jellyfin cleanly anytime:   ./$(basename "$0") --uninstall ${APP_NAME}
 ================================================================================
 EOF
+
 
 # ==============================================================================
 # 12. VERIFY LIVE HTTP RESPONSE & PRINT CLOSING BANNER
